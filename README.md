@@ -7,7 +7,7 @@ Hermes hands its configured user's Slack requests to Meta Muse side chats, check
 3. Muse's replies appear in that thread. Hermes judges them and follows up with `muse_reply`, shown as "Hermes → Muse", until it is satisfied. `muse_wait` keeps waiting when Muse needs more than about five minutes.
 4. Hermes gives the answer in its normal reply, which [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts at the top of the channel. In DMs, Hermes's replies stay in their thread.
 
-A short guide is added to each of the user's Slack turns so Hermes follows these steps; the user's messages in a handoff thread get the thread's own guide. Messages typed directly in the side chat also appear in the thread. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
+A short guide is added to each of the user's Slack turns so Hermes follows these steps; the user's messages in a handoff thread get the thread's own guide. The guide does not outrank the profile's own instructions. If `SOUL.md` tells Hermes to delegate requests to other agents, add a rule there that the user's Slack requests go to Muse through `muse_handoff`, then run `hermes sessions refresh-prompts`. Without it, Hermes on Hermes Cloud answered through `delegate_task` instead. Messages typed directly in the side chat also appear in the thread. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
 
 ## Set up Muse
 

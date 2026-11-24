@@ -56,17 +56,13 @@ class MuseChat:
 
     async def ensure_registered(self, chat_id):
         current = await self.call("muse_directory_get", chat=chat_id)
-        if current.get("in_directory"):
-            if current.get("sendable") and current.get("entry", {}).get("kind") == "side":
-                return
-            raise MuseError("registered side chat is suspended or has an unexpected kind")
-        if current.get("entry"):
-            raise MuseError("side chat ID is already present in Muse's registry")
-        revision = current.get("directory_revision") or current.get("revision")
-        if not revision:
-            raise MuseError("Muse directory revision unavailable")
+        action = call(__file__, "directoryRegistration", current)
+        if "error" in action:
+            raise MuseError(action["error"])
+        if "revision" not in action:
+            return
         result = await self.call(
-            "muse_directory_set", chat_id=chat_id, base_revision=revision,
+            "muse_directory_set", chat_id=chat_id, base_revision=action["revision"],
             name=f"Hermes {chat_id}", kind="side",
             purpose="Linked to a Hermes Slack handoff", **{"from": CALLER},
         )

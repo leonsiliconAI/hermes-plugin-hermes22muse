@@ -1,4 +1,8 @@
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+// slack.ts
+function slackPermalink(channel, ts) {
+	return "https://app.slack.com/archives/" + channel + "/p" + ts.replaceAll(".", "");
+}
 // policy.ts
 const unfinished = /* @__PURE__ */ new Set([
 	"pending",
@@ -60,9 +64,6 @@ const timestamp = /^[0-9]+\.[0-9]{6}$/;
 function ownsRequest(user, owner, team, channel, ts) {
 	return user === owner && /^T[A-Z0-9]+$/.test(team) && /^[CDG][A-Z0-9]+$/.test(channel) && typeof ts === "string" && ts === ts.trim() && timestamp.test(ts);
 }
-function permalink(channel, ts) {
-	return "https://app.slack.com/archives/" + channel + "/p" + ts.replaceAll(".", "");
-}
 function escapeSlack(text) {
 	return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
@@ -91,7 +92,7 @@ function sideChat(handoff) {
 }
 /** What Muse receives for a new handoff, and the thread post that shows all of it. */
 function handoffTexts(task, channel, ts, handoff) {
-	const muse = "Hermes, Leon's assistant, is handing you a task from Slack (" + permalink(channel, ts) + "). Work on it in this chat and reply here. Hermes reads your replies, may follow up, and passes your final answer to Leon. Leon may also join this chat.\n\nTask:\n" + task;
+	const muse = "Hermes, Leon's assistant, is handing you a task from Slack (" + slackPermalink(channel, ts) + "). Work on it in this chat and reply here. Hermes reads your replies, may follow up, and passes your final answer to Leon. Leon may also join this chat.\n\nTask:\n" + task;
 	return {
 		muse,
 		thread: "Handed to Muse. Side chat: " + sideChat(handoff) + "\nEverything sent to Muse:\n\n" + muse
@@ -135,16 +136,134 @@ function retryDelay(failures, retryAfter) {
 	const backoff = Math.min(300, 5 * 2 ** Math.min(failures, 6));
 	return /^\d+$/.test(retryAfter) ? Math.max(backoff, Number(retryAfter)) : backoff;
 }
+function slackTurn(current, owner) {
+	if (current?.platform === "slack" && ownsRequest(current.user_id, owner, current.scope_id, current.chat_id, current.message_id) && (!current.thread_id || current.thread_id === current.thread_id.trim() && timestamp.test(current.thread_id))) return current;
+}
+function guideForTurn(current, owner, existing) {
+	return { context: existing && existing.request !== current.message_id ? threadGuide(existing.id) : handoffGuide(owner) };
+}
+function answerRows(job, receipt, rows, quiet) {
+	if (!job || !receipt) return {
+		status: "not_delivered",
+		messages: []
+	};
+	return {
+		status: rows.at(-1)?.role === "assistant" && !job.busy && job.polled - job.changed >= quiet ? "answered" : "working",
+		messages: rows.map((row) => ({
+			from: row.role === "assistant" ? "muse" : "leon_in_muse",
+			text: row.text
+		}))
+	};
+}
+async function runTool(host, tool, args, session, owner, seconds) {
+	if (!host) return { error: "The Muse relay is not running in this gateway." };
+	const current = slackTurn(session, owner);
+	let job;
+	if (tool === "handoff") {
+		if (!current) return { error: "muse_handoff only hands over Leon's own Slack messages." };
+		const task = String(args.task || "").trim();
+		if (!task) return { error: "task is empty. Write the complete task, or ask Leon what he needs." };
+		const { scope_id: team, chat_id: channel, message_id: message } = current;
+		const thread = current.thread_id || message;
+		const existing = await host.find(team, channel, message, thread);
+		if (existing) return { error: "This message already belongs to handoff " + existing.id + ". Use muse_reply to send Muse more, or muse_wait to wait for its answer." };
+		const texts = handoffTexts(task, channel, message, host.handoffId(team, channel, message));
+		const id = await host.create(team, channel, message, thread, owner, texts.muse, texts.thread);
+		if (!id) return { error: "This Slack thread already has a handoff. Use muse_reply instead." };
+		host.logHandoff(channel, message, id);
+		job = await host.lookup(id);
+	} else {
+		const text = String(args.text || "").trim();
+		if (tool === "reply" && !text) return { error: "text is empty." };
+		const handoff = String(args.handoff || "").trim();
+		if (handoff) {
+			const match = await host.lookup(handoff);
+			if (match?.actor === owner) job = match;
+		} else if (current) job = await host.find(current.scope_id, current.chat_id, current.message_id, current.thread_id);
+		if (job && tool === "reply") await host.followUp(job.id, text, followUpThread(text));
+	}
+	if (!job) return { error: "No handoff found. Pass the handoff ID that muse_handoff returned." };
+	const deadline = host.now() + seconds;
+	for (let polls = 0;; polls++) {
+		const { status, messages } = await host.answer(job.id);
+		if (status === "answered" || host.now() >= deadline) return {
+			status,
+			handoff: job.id,
+			side_chat: sideChat(job.id),
+			slack_thread: slackPermalink(job.channel, job.root),
+			messages,
+			next: nextStep(status)
+		};
+		if (polls % 3 === 0) await host.touch(job.id);
+		await host.sleep();
+	}
+}
+async function sendInbound(host, job, entry, identifier, stamp) {
+	const first = entry.ts === job.request;
+	const prefix = "[Hermes delivery " + identifier + "]\n";
+	if (first) await host.register(job.id);
+	if (entry.attempted && (!first || await host.exists(job.id))) {
+		const previous = (await host.history(job.id)).find((message) => message.role === "user" && message.text.startsWith(stamp + prefix));
+		if (previous) {
+			await host.accepted(job.id, entry.ts, previous.id);
+			return;
+		}
+	}
+	await host.attempted(job.id, entry.ts);
+	let text = entry.text;
+	if (host.byteLength(stamp + prefix + text) > 65536) text = host.clipUtf8(text, 61440) + "\n\n[Shortened. The rest is in the Slack thread] " + slackPermalink(job.channel, job.root);
+	await host.accepted(job.id, entry.ts, await host.send(job.id, prefix + text));
+}
+function collectPlan(messages, existing, posted, echoed, full, busy, oldBusy, stamp) {
+	const known = new Set(existing);
+	const alreadyPosted = new Set(posted);
+	const inbound = new Set(echoed);
+	const rows = messages.filter((message) => !known.has(message.id));
+	const output = [];
+	if (full && !known.size && !alreadyPosted.size && messages.length) output.push({
+		id: "gap/" + messages[0].id,
+		parts: ["Muse’s recent history filled its read window. Some earlier messages may be missing."]
+	});
+	for (const message of rows) {
+		if (alreadyPosted.has(message.id)) continue;
+		const parts = slackDelivery(message, inbound.has(message.id), stamp);
+		if (parts[0] !== null) output.push({
+			id: message.id,
+			parts
+		});
+	}
+	return {
+		rows,
+		output,
+		activity: rows.length > 0,
+		changed: rows.length > 0 || oldBusy !== void 0 && oldBusy !== busy
+	};
+}
+function directoryRegistration(current) {
+	if (current.in_directory) {
+		if (current.sendable && current.entry?.kind === "side") return {};
+		return { error: "registered side chat is suspended or has an unexpected kind" };
+	}
+	if (current.entry) return { error: "side chat ID is already present in Muse's registry" };
+	const revision = current.directory_revision || current.revision;
+	return revision ? { revision } : { error: "Muse directory revision unavailable" };
+}
+exports.answerRows = answerRows;
+exports.collectPlan = collectPlan;
+exports.directoryRegistration = directoryRegistration;
 exports.followUpThread = followUpThread;
+exports.guideForTurn = guideForTurn;
 exports.handoffGuide = handoffGuide;
 exports.handoffTexts = handoffTexts;
 exports.history = history;
 exports.nextStep = nextStep;
 exports.ownsRequest = ownsRequest;
-exports.permalink = permalink;
 exports.pollDelay = pollDelay;
 exports.retryDelay = retryDelay;
+exports.runTool = runTool;
+exports.sendInbound = sendInbound;
 exports.sideChat = sideChat;
 exports.slackChunks = slackChunks;
 exports.slackDelivery = slackDelivery;
+exports.slackTurn = slackTurn;
 exports.threadGuide = threadGuide;

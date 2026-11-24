@@ -9,13 +9,12 @@ import re
 import time
 from contextlib import suppress
 
-from ._pythonmonkey import call
+from ._pythonmonkey import blocking, call
 from .muse import Muse
-from .relay import Relay, Slack, Store, operation_id, side_chat_url, slack_permalink
+from .relay import Relay, Slack, Store, operation_id
 
 LOG = logging.getLogger(__name__)
 USER_ID = re.compile(r"[UW][A-Z0-9]+")
-SLACK_TS = re.compile(r"[0-9]+\.[0-9]{6}")
 TOOLSET = "hermes22muse"
 # Hermes stops a tool call after 420 seconds by default; return before that and let Hermes wait again.
 WAIT = 330
@@ -96,104 +95,56 @@ def register(ctx):
     def owns_slack_request(user, team, channel, message_id):
         return call(__file__, "ownsRequest", user, owner, team or "", channel or "", message_id)
 
-    def turn():
-        """The current Slack turn's coordinates when Leon sent it, else None."""
-        current = session()
-        if current["platform"] != "slack" or not owns_slack_request(
-                current["user_id"], current["scope_id"], current["chat_id"], current["message_id"]):
-            return None
-        if current["thread_id"] and not SLACK_TS.fullmatch(current["thread_id"]):
-            return None
-        return current
+    def run_tool(name, args):
+        store = relay.store if relay else None
+        host = None
+        if store:
+            def lookup(*arguments):
+                row = store.handoff(*arguments)
+                return dict(row) if row is not None else None
 
-    def resolve(args, current):
-        handoff = str(args.get("handoff") or "").strip()
-        if handoff:
-            job = relay.store.handoff(handoff)
-            return job if job and job["actor"] == owner else None
-        if current is None:
-            return None
-        return relay.store.find(current["scope_id"], current["chat_id"],
-                                request=current["message_id"], thread=current["thread_id"])
+            def find(*coordinates):
+                row = store.find(*coordinates)
+                return dict(row) if row is not None else None
 
-    def wait(job):
-        deadline = time.monotonic() + WAIT
-        polls = 0
-        while True:
-            status, messages = relay.store.answer(job["id"])
-            if status == "answered" or time.monotonic() >= deadline:
-                break
-            if polls % 3 == 0:
-                relay.store.touch(job["id"])
-            polls += 1
-            time.sleep(1)
-        return json.dumps({
-            "status": status, "handoff": job["id"], "side_chat": side_chat_url(job["id"]),
-            "slack_thread": slack_permalink(job["channel"], job["root"]),
-            "messages": messages, "next": call(__file__, "nextStep", status),
-        })
+            def answer(job_id):
+                status, messages = store.answer(job_id)
+                return {"status": status, "messages": messages}
 
-    def error(message):
-        return json.dumps({"error": message})
+            async def pause():
+                await asyncio.sleep(1)
+
+            host = {
+                "lookup": blocking(lookup), "find": blocking(find),
+                "handoffId": operation_id, "create": blocking(store.create),
+                "followUp": blocking(store.follow_up), "answer": blocking(answer),
+                "touch": blocking(store.touch), "now": lambda: time.monotonic(),
+                "sleep": pause,
+                "logHandoff": lambda channel, message, job: LOG.info(
+                    "hermes22muse: handed %s:%s to Muse as %s", channel, message, job),
+            }
+        return json.dumps(call(__file__, "runTool", host, name, args, session() if store else None, owner, WAIT))
 
     def handoff_tool(args, **_):
-        if relay is None:
-            return error("The Muse relay is not running in this gateway.")
-        current = turn()
-        if current is None:
-            return error("muse_handoff only hands over Leon's own Slack messages.")
-        task = str(args.get("task") or "").strip()
-        if not task:
-            return error("task is empty. Write the complete task, or ask Leon what he needs.")
-        team, channel = current["scope_id"], current["chat_id"]
-        thread = current["thread_id"] or current["message_id"]
-        existing = relay.store.find(team, channel, request=current["message_id"], thread=thread)
-        if existing:
-            return error(f"This message already belongs to handoff {existing['id']}. "
-                         "Use muse_reply to send Muse more, or muse_wait to wait for its answer.")
-        texts = call(__file__, "handoffTexts", task, channel, current["message_id"],
-                     operation_id(team, channel, current["message_id"]))
-        job_id = relay.store.create(
-            team, channel, current["message_id"], thread, owner, texts["muse"], texts["thread"])
-        if job_id is None:
-            return error("This Slack thread already has a handoff. Use muse_reply instead.")
-        LOG.info("hermes22muse: handed %s:%s to Muse as %s", channel, current["message_id"], job_id)
-        return wait(relay.store.handoff(job_id))
+        return run_tool("handoff", args)
 
     def reply_tool(args, **_):
-        if relay is None:
-            return error("The Muse relay is not running in this gateway.")
-        text = str(args.get("text") or "").strip()
-        if not text:
-            return error("text is empty.")
-        job = resolve(args, turn())
-        if job is None:
-            return error("No handoff found. Pass the handoff ID that muse_handoff returned.")
-        relay.store.follow_up(job["id"], text, call(__file__, "followUpThread", text))
-        return wait(job)
+        return run_tool("reply", args)
 
     def wait_tool(args, **_):
-        if relay is None:
-            return error("The Muse relay is not running in this gateway.")
-        job = resolve(args, turn())
-        if job is None:
-            return error("No handoff found. Pass the handoff ID that muse_handoff returned.")
-        return wait(job)
+        return run_tool("wait", args)
 
     def guide(**kwargs):
         if relay is None or (kwargs.get("platform") or "slack") != "slack":
             return None
         try:
-            current = turn()
+            current = call(__file__, "slackTurn", session(), owner)
         except Exception:
             return None
         if current is None:
             return None
-        if current["thread_id"]:
-            job = relay.store.find(current["scope_id"], current["chat_id"], thread=current["thread_id"])
-            if job and job["request"] != current["message_id"]:
-                return {"context": call(__file__, "threadGuide", job["id"])}
-        return {"context": call(__file__, "handoffGuide", owner)}
+        job = relay.store.find(current["scope_id"], current["chat_id"], thread=current["thread_id"]) if current["thread_id"] else None
+        return call(__file__, "guideForTurn", current, owner, dict(job) if job else None)
 
     def wire(_native, adapter):
         nonlocal relay

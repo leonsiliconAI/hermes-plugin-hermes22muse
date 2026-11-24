@@ -8,7 +8,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing, contextmanager
-from ._pythonmonkey import call
+from ._pythonmonkey import acall_with_host, call
 from .muse import STAMP
 
 LOG = logging.getLogger(__name__)
@@ -22,18 +22,6 @@ SLEEP = 10 * 365 * 86400
 
 def operation_id(*parts):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "hermes22muse/" + "/".join(parts)))
-
-
-def marker(message_id):
-    return f"[Hermes delivery {message_id}]\n"
-
-
-def slack_permalink(channel, ts):
-    return call(__file__, "permalink", channel, ts)
-
-
-def side_chat_url(job_id):
-    return call(__file__, "sideChat", job_id)
 
 
 def slack_chunks(text):
@@ -136,19 +124,17 @@ class Store:
             last = db.execute(
                 "SELECT receipt FROM inbound WHERE handoff=? ORDER BY rowid DESC LIMIT 1", (job_id,),
             ).fetchone()
-            if not job or not last or not last["receipt"]:
-                return "not_delivered", []
+            receipt = last["receipt"] if last else None
             sent = db.execute("SELECT seq FROM transcript WHERE handoff=? AND id=?",
-                              (job_id, last["receipt"])).fetchone()
+                              (job_id, receipt)).fetchone()
             rows = db.execute(
                 "SELECT role, text FROM transcript WHERE handoff=? AND seq>? ORDER BY seq",
                 (job_id, sent["seq"] if sent else 2 ** 62),
             ).fetchall()
-            messages = [{"from": "muse" if row["role"] == "assistant" else "leon_in_muse",
-                         "text": row["text"]} for row in rows]
-            done = (rows and rows[-1]["role"] == "assistant" and not job["busy"]
-                    and job["polled"] - job["changed"] >= QUIET)
-            return ("answered" if done else "working"), messages
+            answer = call(__file__, "answerRows", dict(job) if job else None, receipt,
+                          [dict(row) for row in rows], QUIET)
+            return answer["status"], answer["messages"]
+
 
     def due(self, actor, running=()):
         with self.connection() as db:
@@ -197,31 +183,21 @@ class Store:
             posted = {row["event"] for row in db.execute(
                 f"SELECT DISTINCT event FROM outbound WHERE handoff=? AND event IN ({marks})", (job_id, *ids),
             )}
-            if full and not known and not posted and messages:
-                # A first full window can also miss earlier rows before the first poll.
-                self._add_output(db, job_id, "gap/" + ids[0], [
-                    "Muse’s recent history filled its read window. Some earlier messages may be missing.",
-                ])
-            added = False
-            for message in messages:
-                if message.id in known:
-                    continue
-                added = True
-                db.execute("INSERT OR IGNORE INTO transcript(handoff, id, role, text) VALUES (?, ?, ?, ?)",
-                           (job_id, message.id, message.role, message.text))
-                if message.id in posted:
-                    continue
-                parts = call(__file__, "slackDelivery",
-                             {"id": message.id, "role": message.role, "text": message.text},
-                             message.id in echoed, STAMP)
-                if parts != [None]:
-                    self._add_output(db, job_id, message.id, parts)
             old = db.execute("SELECT busy FROM handoffs WHERE id=?", (job_id,)).fetchone()
-            changed = added or bool(old and old["busy"] != int(busy))
+            plan = call(
+                __file__, "collectPlan", [vars(message) for message in messages], list(known),
+                list(posted), list(echoed), full, busy, bool(old["busy"]) if old else None, STAMP,
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO transcript(handoff, id, role, text) VALUES (?, ?, ?, ?)",
+                ((job_id, row["id"], row["role"], row["text"]) for row in plan["rows"]),
+            )
+            for item in plan["output"]:
+                self._add_output(db, job_id, item["id"], item["parts"])
             db.execute(
                 "UPDATE handoffs SET busy=?, polled=?, changed=CASE WHEN ? THEN ? ELSE changed END,"
                 " activity=CASE WHEN ? THEN ? ELSE activity END WHERE id=?",
-                (int(busy), now, changed, now, added, now, job_id),
+                (int(busy), now, plan["changed"], now, plan["activity"], now, job_id),
             )
 
     @staticmethod
@@ -303,24 +279,18 @@ class Relay:
         self.store, self.slack, self.muse, self.actor = store, slack, muse, actor
 
     async def send_to_muse(self, muse, job, entry):
-        job_id, ts = job["id"], entry["ts"]
-        first = ts == job["request"]
-        prefix = marker(operation_id(job_id, ts))
-        if first:
-            await muse.ensure_registered(job_id)
-        if entry["attempted"] and (not first or await muse.exists(job_id)):
+        async def history(job_id):
             messages, _, _ = await muse.history(job_id)
-            for message in messages:
-                if message.role == "user" and message.text.startswith(STAMP + prefix):
-                    self.store.accepted(job_id, ts, message.id)
-                    return
-        self.store.attempted(job_id, ts)
-        text = entry["text"]
-        if len((STAMP + prefix + text).encode("utf-8")) > 64 * 1024:
-            text = text.encode("utf-8")[:60 * 1024].decode("utf-8", errors="ignore")
-            text += f"\n\n[Shortened. The rest is in the Slack thread] {slack_permalink(job['channel'], job['root'])}"
-        receipt = await muse.send(job_id, prefix + text)
-        self.store.accepted(job_id, ts, receipt)
+            return [vars(message) for message in messages]
+
+        await acall_with_host(__file__, "sendInbound", {
+            "register": muse.ensure_registered, "exists": muse.exists,
+            "history": history, "attempted": self.store.attempted,
+            "accepted": self.store.accepted, "send": muse.send,
+        }, dict(job), dict(entry), operation_id(job["id"], entry["ts"]), STAMP, immediate={
+            "byteLength": lambda text: len(text.encode("utf-8")),
+            "clipUtf8": lambda text, limit: text.encode("utf-8")[:int(limit)].decode("utf-8", errors="ignore"),
+        })
 
     async def tick(self, job):
         job_id, root = job["id"], job["root"]
