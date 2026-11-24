@@ -24,11 +24,15 @@ class Message:
 
 
 def history_messages(result, chat_id):
-    """Project completed conversation rows from the Link's response envelope."""
+    """Project completed conversation rows from the Link's response envelope.
+
+    Returns the messages in the Link's chronological order, whether the read window was full,
+    and whether Muse was still writing a reply when the window was read.
+    """
     history = call(__file__, "history", result, chat_id, HISTORY_LIMIT)
     if "error" in history:
         raise MuseError(history["error"])
-    return [Message(**row) for row in history["messages"]], history["full"]
+    return [Message(**row) for row in history["messages"]], history["full"], history["busy"]
 
 
 class MuseChat:

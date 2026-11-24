@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -16,10 +17,11 @@ sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 from hermes22muse.muse import Message, MuseChat, MuseError, STAMP, history_messages
+from hermes22muse import relay as relay_module
 from hermes22muse.relay import Relay, Slack, Store, operation_id
 
-TEAM, CHANNEL, OWNER = "T001", "D001", "U001"
-REQUEST, ROOT, FOLLOWUP = "1795000000.000001", "1795000001.000001", "1795000002.000001"
+TEAM, CHANNEL, OWNER = "T001", "C001", "U001"
+REQUEST, LATER = "1795000000.000001", "1795000002.000001"
 JOB = operation_id(TEAM, CHANNEL, REQUEST)
 
 
@@ -29,6 +31,7 @@ class FakeMuse:
         self.registrations = []
         self.sends = []
         self.lose_receipt = False
+        self.busy = False
 
     @asynccontextmanager
     async def connect(self):
@@ -50,24 +53,26 @@ class FakeMuse:
         return message_id
 
     async def history(self, chat_id):
-        return self.chats[chat_id], False
+        return self.chats[chat_id], False, self.busy
 
 
 def fake_adapter():
-    client = SimpleNamespace(
-        chat_postMessage=AsyncMock(return_value={"ok": True, "ts": ROOT, "channel": CHANNEL}),
-        conversations_history=AsyncMock(return_value={"ok": True, "messages": []}),
-    )
+    posts = iter(range(1, 1000))
+    client = SimpleNamespace(chat_postMessage=AsyncMock(
+        side_effect=lambda **kw: {"ok": True, "ts": f"1795000100.{next(posts):06d}", "channel": kw["channel"]},
+    ))
     adapter = SimpleNamespace(
         _outbound_blocked=lambda channel, action: False,
         _get_client=lambda channel, team_id: client,
         _team_clients={TEAM: client},
-        _team_bot_user_ids={TEAM: "U001BOT"},
-        _register_mentioned_thread=lambda ts, team: None,
         _running=False,
         disconnect=AsyncMock(),
     )
     return adapter, client
+
+
+def posts(client):
+    return [(call.kwargs["thread_ts"], call.kwargs["text"]) for call in client.chat_postMessage.await_args_list]
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
@@ -80,88 +85,97 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.muse = FakeMuse()
         self.relay = Relay(self.store, Slack(self.adapter), self.muse, OWNER)
 
-    def queue_request(self, thread=""):
-        self.store.enqueue(TEAM, CHANNEL, thread, REQUEST, OWNER, "Find a recipe")
-        self.store.enqueue(TEAM, CHANNEL, thread, REQUEST, OWNER, "duplicate event")
+    def create(self, thread=REQUEST):
+        return self.store.create(TEAM, CHANNEL, REQUEST, thread, OWNER, "Task:\nFind a recipe",
+                                 "Everything sent to Muse:\n\nTask:\nFind a recipe")
 
     async def tick(self):
         with self.store.connection() as db:
             db.execute("UPDATE handoffs SET due=0")
         await self.relay.tick(self.store.due(OWNER)[0])
 
-    async def test_root_created_in_original_chat_and_two_way_sync_survives_restart(self):
-        self.queue_request(thread="1794999999.000001")
-        await self.tick()
-        root_post = self.client.chat_postMessage.await_args.kwargs
-        self.assertNotIn("thread_ts", root_post)
-        self.assertIn(f"https://muse.ai/thread/{JOB}", root_post["text"])
-        self.assertEqual(self.muse.registrations, [JOB])
-        self.assertEqual(len(self.muse.sends), 1)
-        self.assertIn("Find a recipe", self.muse.sends[0][1])
+    def settle(self):
+        with self.store.connection() as db:
+            db.execute(f"UPDATE handoffs SET changed=changed-{relay_module.QUIET}")
 
-        self.muse.chats[JOB].extend([
-            Message("answer", "assistant", "Do you want soup?"),
-            Message("direct", "user", "Yes, from Muse"),
-        ])
+    async def test_thread_under_request_holds_task_answer_and_follow_up(self):
+        self.assertEqual(self.create(), JOB)
+        self.assertIsNone(self.create(), "a second handoff for the same message")
+        await self.tick()
+        self.assertEqual(posts(self.client), [(REQUEST, "Everything sent to Muse:\n\nTask:\nFind a recipe")])
+        self.assertEqual(self.muse.registrations, [JOB])
+        self.assertTrue(self.muse.sends[0][1].endswith("Task:\nFind a recipe"))
+        self.assertEqual(self.store.answer(JOB), ("working", []))
+
+        self.muse.chats[JOB].append(Message("answer", "assistant", "Do you want soup?"))
+        self.muse.busy = True
+        await self.tick()
+        self.settle()
+        self.assertEqual(self.store.answer(JOB)[0], "working", "Muse is still writing")
+        self.muse.busy = False
+        await self.tick()
+        self.assertEqual(self.store.answer(JOB)[0], "working", "not quiet yet")
+        self.settle()
+        await self.tick()
+        self.assertEqual(self.store.answer(JOB), ("answered", [{"from": "muse", "text": "Do you want soup?"}]))
+
+        # A restarted gateway keeps the handoff; Hermes follows up and Leon also writes in Muse.
         self.store = Store(self.directory)
         self.relay = Relay(self.store, Slack(self.adapter), self.muse, OWNER)
-        self.store.enqueue(TEAM, CHANNEL, ROOT, FOLLOWUP, OWNER, "Vegetarian, please")
+        self.store.follow_up(JOB, "Vegetarian, please", "Hermes → Muse\nVegetarian, please")
         await self.tick()
+        self.assertTrue(self.muse.sends[1][1].endswith("]\nVegetarian, please"))
+        self.assertEqual(self.store.answer(JOB), ("working", []), "the earlier answer no longer counts")
+        self.muse.chats[JOB] += [Message("direct", "user", "No mushrooms"), Message("final", "assistant", "Lentil soup")]
         await self.tick()
+        self.settle()
         await self.tick()
-
-        self.assertEqual(len(self.muse.sends), 2)
-        self.assertEqual(self.muse.sends[1][0], JOB)
-        self.assertIn("Vegetarian, please", self.muse.sends[1][1])
-        self.assertEqual(
-            [(post.kwargs.get("thread_ts"), post.kwargs["text"])
-             for post in self.client.chat_postMessage.await_args_list[1:]],
-            [(ROOT, "Muse\nDo you want soup?"), (ROOT, "You in Muse\nYes, from Muse")],
-        )
+        self.assertEqual(self.store.answer(JOB), ("answered", [
+            {"from": "leon_in_muse", "text": "No mushrooms"}, {"from": "muse", "text": "Lentil soup"},
+        ]))
+        self.assertEqual(posts(self.client)[1:], [
+            (REQUEST, "Muse\nDo you want soup?"), (REQUEST, "Hermes → Muse\nVegetarian, please"),
+            (REQUEST, "You in Muse\nNo mushrooms"), (REQUEST, "Muse\nLentil soup"),
+        ])
         self.assertIsNone(self.store.next_inbound(JOB))
 
     async def test_receipt_lost_after_muse_acceptance_recovers_in_same_chat(self):
-        self.queue_request()
+        self.create()
         self.muse.lose_receipt = True
         await self.tick()
         await self.tick()
         self.assertIsNone(self.store.next_inbound(JOB))
         self.assertEqual(len(self.muse.sends), 1)
-        self.client.chat_postMessage.assert_awaited_once()
 
-    async def test_you_can_recover_slack_root_after_a_lost_receipt(self):
-        self.queue_request()
-        self.client.chat_postMessage.side_effect = TimeoutError
+    async def test_handoffs_from_1x_are_not_relayed_again(self):
+        with self.store.connection() as db:
+            db.execute("INSERT INTO handoffs(id, team, channel, request, actor, root, activity) "
+                       "VALUES (?, ?, ?, ?, ?, ?, 0)", (JOB, TEAM, CHANNEL, REQUEST, OWNER, LATER))
+            db.execute("INSERT INTO outbound(handoff, event, part, text) VALUES (?, 'old', 0, NULL)", (JOB,))
+        self.muse.chats[JOB] = [Message("old", "assistant", "Already in Slack"), Message("new", "assistant", "New")]
         await self.tick()
-        self.assertEqual(self.muse.sends, [])
-        self.client.conversations_history.return_value = {
-            "ok": True, "messages": [
-                {"ts": ROOT, "user": "U001BOT", "text": f"Open https://muse.ai/thread/{JOB}"},
-            ],
-        }
         await self.tick()
-        self.client.chat_postMessage.assert_awaited_once()
-        self.assertEqual(self.store.due(OWNER, {JOB}), [])
-        self.assertEqual(len(self.muse.sends), 1)
+        self.assertEqual(posts(self.client), [(LATER, "Muse\nNew")])
 
-    async def test_distinct_request_and_workspace_get_distinct_side_chats(self):
-        self.queue_request()
-        self.store.enqueue("T002", CHANNEL, "", REQUEST, OWNER, "Other workspace")
-        self.store.enqueue(TEAM, CHANNEL, "", FOLLOWUP, OWNER, "New request")
-        self.assertEqual(
-            {job["id"] for job in self.store.due(OWNER)},
-            {JOB, operation_id("T002", CHANNEL, REQUEST), operation_id(TEAM, CHANNEL, FOLLOWUP)},
-        )
+    async def test_idle_handoffs_back_off_then_stop(self):
+        self.create()
+        await self.tick()
+        for idle, delay in ((10, 5), (600, 60), (7200, 600), (2 * 86400, relay_module.SLEEP)):
+            with self.store.connection() as db:
+                db.execute("UPDATE handoffs SET activity=?", (relay_module.time.time() - idle,))
+            job = self.store.handoff(JOB)
+            self.store.schedule(job)
+            self.assertAlmostEqual(self.store.handoff(JOB)["due"] - relay_module.time.time(), delay, delta=2)
 
     async def test_history_windows_and_slack_escaping(self):
-        self.queue_request()
+        self.create()
         message = Message("answer", "assistant", "<!channel> & " + "x" * 4000)
         self.store.collect(JOB, [message], True)
         self.store.collect(JOB, [message], True)
         parts = [item["text"] for item in self.store.pending_output(JOB)]
-        self.assertEqual(len(parts), 3)
-        self.assertIn("earlier messages may be missing", parts[0])
-        self.assertIn("&lt;!channel&gt; &amp; ", parts[1])
+        self.assertEqual(len(parts), 4)
+        self.assertIn("earlier messages may be missing", parts[1])
+        self.assertIn("&lt;!channel&gt; &amp; ", parts[2])
 
     async def test_muse_mcp_decodes_unstructured_json_tool_content(self):
         result = SimpleNamespace(
@@ -174,10 +188,17 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             "muse_chat_exists", arguments={"chat": JOB, "from": "hermes22muse"},
         )
 
-    async def test_gateway_only_consumes_the_configured_slack_user(self):
+
+class ToolTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.tools, self.hooks = {}, {}
         ctx = SimpleNamespace(
+            register_tool=lambda name, handler, **kw: self.tools.__setitem__(name, handler),
             register_platform_handler=lambda platform, factory: setattr(ctx, "wire", factory),
-            register_hook=lambda name, callback: setattr(ctx, "consume", callback),
+            register_hook=lambda name, callback: self.hooks.__setitem__(name, callback),
         )
         env = {
             "HERMES22MUSE_SLACK_USER_ID": OWNER,
@@ -186,50 +207,96 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         }
         with patch.dict(os.environ, env):
             plugin.register(ctx)
+        self.adapter, self.client = fake_adapter()
         constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
         with patch.dict(sys.modules, {"hermes_constants": constants}):
             ctx.wire(None, self.adapter)
-        try:
-            source = {"user_id": OWNER, "chat_id": CHANNEL, "scope_id": TEAM}
-            self.assertIsNone(ctx.consume("telegram", source, REQUEST, "hi"))
-            self.assertIsNone(ctx.consume("slack", {**source, "user_id": "UOTHER"}, REQUEST, "hi"))
-            self.assertIsNone(ctx.consume("slack", {**source, "scope_id": ""}, REQUEST, "hi"))
-            self.assertEqual(ctx.consume("slack", source, REQUEST, "hi"), {"action": "handled"})
-            self.assertTrue(self.adapter._hermes22muse_owns_request(OWNER, TEAM, CHANNEL, REQUEST))
-        finally:
-            await self.adapter.disconnect()
+        self.addAsyncCleanup(self.adapter.disconnect)
+        self.session = {"platform": "slack", "scope_id": TEAM, "chat_id": CHANNEL, "thread_id": "",
+                        "message_id": REQUEST, "user_id": OWNER}
+        patcher = patch.object(plugin, "session", lambda: dict(self.session))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in (("WAIT", 0),):
+            patcher = patch.object(plugin, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.store = Store(self.directory / "hermes22muse")
+
+    def call(self, name, **args):
+        return json.loads(self.tools[name](args))
+
+    async def test_handoff_threads_under_leons_message_with_everything_sent(self):
+        guide = self.hooks["pre_llm_call"](platform="slack")["context"]
+        self.assertIn(f"mention <@{OWNER}>", guide)
+        self.assertIn("muse_handoff", guide)
+        result = self.call("muse_handoff", task="Summarize LEON-1 and its open questions")
+        self.assertEqual(result["status"], "not_delivered")
+        self.assertEqual(result["handoff"], JOB)
+        self.assertEqual(result["side_chat"], f"https://muse.ai/thread/{JOB}")
+        job = self.store.handoff(JOB)
+        self.assertEqual(job["root"], REQUEST)
+        sent = self.store.next_inbound(JOB)["text"]
+        self.assertTrue(sent.endswith("Task:\nSummarize LEON-1 and its open questions"))
+        [thread_post] = [row["text"] for row in self.store.pending_output(JOB)]
+        self.assertIn(f"Side chat: https://muse.ai/thread/{JOB}", thread_post)
+        self.assertTrue(thread_post.endswith(sent))
+        self.assertIn("already belongs", self.call("muse_handoff", task="again")["error"])
+
+        # Leon writes in the thread; Hermes forwards it.
+        self.session.update(thread_id=REQUEST, message_id=LATER)
+        self.assertIn(JOB, self.hooks["pre_llm_call"](platform="slack")["context"])
+        self.assertEqual(self.call("muse_reply", text="Only the blockers")["handoff"], JOB)
+        self.assertEqual(self.store.pending_output(JOB)[-1]["text"], "Hermes → Muse\nOnly the blockers")
+        self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
+
+    async def test_tools_and_guide_ignore_other_people_and_platforms(self):
+        for change in ({"user_id": "UOTHER"}, {"platform": "telegram"}, {"scope_id": ""}):
+            with self.subTest(change=change):
+                saved = dict(self.session)
+                self.session.update(change)
+                self.assertIn("error", self.call("muse_handoff", task="Do it"))
+                self.assertIsNone(self.hooks["pre_llm_call"](platform=self.session["platform"]))
+                self.session = saved
+        self.assertIn("error", self.call("muse_handoff", task="  "))
+        self.assertIn("error", self.call("muse_reply", text="hi", handoff="unknown"))
+        self.assertTrue(self.adapter._hermes22muse_owns_request(OWNER, TEAM, CHANNEL, REQUEST))
 
 
 class HistoryTests(unittest.TestCase):
-    def test_only_completed_messages_from_linked_chat_are_projected(self):
+    @staticmethod
+    def event(role, identifier, text, ready=True, **payload):
         # Rows shaped like the Link's GET /chat/history, as recorded on a paired Gadget.
-        def event(role, identifier, text, ready=True, **payload):
-            return {
-                "event_name": f"message.{role}", "role": role, "message_id": identifier,
-                "display_text": text, "display_text_ready": ready, "seq": 1,
-                "payload": {
-                    "session_id": JOB, "message_id": identifier, "role": role, "content": text,
-                    "display_text": text, "display_text_ready": ready, **payload,
-                },
-            }
-
-        response = {
-            "ok": True,
-            "status": 200,
-            "scoped_to_chat": "Hermes test",
-            "response": {"ok": True, "result": {"channel": "app", "has_more": False, "chat_events": [
-                event("assistant", "draft", "Dra", ready=False, status="completed"),
-                event("assistant", "streaming", "Half a rep", status="streaming"),
-                event("assistant", "foreign", "private", session_id="main", status="completed"),
-                event("user", "input", "A direct Muse message"),
-                {"event_name": "delta.presentation", "payload": {}},
-                event("assistant", "final", "Done", status="completed"),
-            ]}},
+        return {
+            "event_name": f"message.{role}", "role": role, "message_id": identifier,
+            "display_text": text, "display_text_ready": ready, "seq": 1,
+            "payload": {
+                "session_id": JOB, "message_id": identifier, "role": role, "content": text,
+                "display_text": text, "display_text_ready": ready, **payload,
+            },
         }
-        self.assertEqual(history_messages(response, JOB), ([
+
+    def response(self, *events):
+        return {"ok": True, "status": 200, "scoped_to_chat": "Hermes test", "response": {
+            "ok": True, "result": {"channel": "app", "has_more": False, "chat_events": list(events)}}}
+
+    def test_only_completed_messages_from_linked_chat_are_projected(self):
+        event = self.event
+        self.assertEqual(history_messages(self.response(
+            event("assistant", "foreign", "private", session_id="main", status="completed"),
+            event("user", "input", "A direct Muse message"),
+            {"event_name": "delta.presentation", "payload": {}},
+            event("assistant", "final", "Done", status="completed"),
+        ), JOB), ([
             Message("input", "user", "A direct Muse message"),
             Message("final", "assistant", "Done"),
-        ], False))
+        ], False, False))
+
+    def test_unfinished_replies_are_held_back_and_reported(self):
+        for row in (self.event("assistant", "draft", "Dra", ready=False, status="completed"),
+                    self.event("assistant", "streaming", "Half a rep", status="streaming")):
+            with self.subTest(row=row["message_id"]):
+                self.assertEqual(history_messages(self.response(row), JOB), ([], False, True))
 
     def test_unknown_or_failed_history_is_a_retry(self):
         for response in ({}, {"events": {"items": []}}, {"ok": False, "events": []}):
