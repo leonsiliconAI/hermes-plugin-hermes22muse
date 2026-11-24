@@ -202,21 +202,28 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
 class HistoryTests(unittest.TestCase):
     def test_only_completed_messages_from_linked_chat_are_projected(self):
-        def event(role, identifier, **payload):
+        # Rows shaped like the Link's GET /chat/history, as recorded on a paired Gadget.
+        def event(role, identifier, text, ready=True, **payload):
             return {
-                "event": f"message.{role}",
-                "payload": {"session_id": JOB, "message_id": identifier, **payload},
+                "event_name": f"message.{role}", "role": role, "message_id": identifier,
+                "display_text": text, "display_text_ready": ready, "seq": 1,
+                "payload": {
+                    "session_id": JOB, "message_id": identifier, "role": role, "content": text,
+                    "display_text": text, "display_text_ready": ready, **payload,
+                },
             }
 
         response = {
             "ok": True,
+            "status": 200,
             "scoped_to_chat": "Hermes test",
-            "response": {"ok": True, "result": {"chat_events": [
-                event("assistant", "draft", display_text_ready=False, content="draft"),
-                event("assistant", "foreign", session_id="main", content="private"),
-                event("user", "input", text="A direct Muse message"),
-                {"event": "delta.presentation", "payload": {}},
-                event("assistant", "final", display_text="Done"),
+            "response": {"ok": True, "result": {"channel": "app", "has_more": False, "chat_events": [
+                event("assistant", "draft", "Dra", ready=False, status="completed"),
+                event("assistant", "streaming", "Half a rep", status="streaming"),
+                event("assistant", "foreign", "private", session_id="main", status="completed"),
+                event("user", "input", "A direct Muse message"),
+                {"event_name": "delta.presentation", "payload": {}},
+                event("assistant", "final", "Done", status="completed"),
             ]}},
         }
         self.assertEqual(history_messages(response, JOB), ([

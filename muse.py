@@ -8,6 +8,11 @@ from urllib.parse import urlsplit
 CALLER = "hermes22muse"
 STAMP = f"⟦via muse-mcp · from {CALLER}⟧ "
 HISTORY_LIMIT = 50
+# An assistant row in one of these states is still being written; the relay waits for its final text.
+UNFINISHED = frozenset({
+    "pending", "queued", "running", "in_progress", "started", "active", "working", "streaming",
+    "generating",
+})
 
 
 class MuseError(Exception):
@@ -42,14 +47,16 @@ def history_messages(result, chat_id):
     for event in events:
         if not isinstance(event, dict):
             continue
-        name, payload = event.get("event"), event.get("payload")
+        name, payload = event.get("event_name"), event.get("payload")
         if name not in ("message.user", "message.assistant") or not isinstance(payload, dict):
             continue
         session = payload.get("session_id") or event.get("session_id")
         role = name.split(".")[1]
         if (session and session != chat_id) or payload.get("role") not in (None, role):
             continue
-        if payload.get("display_text_ready") is False:
+        if False in (payload.get("display_text_ready"), event.get("display_text_ready")):
+            continue
+        if role == "assistant" and payload.get("status") in UNFINISHED:
             continue
         identifier = payload.get("message_id") or event.get("message_id") or payload.get("id")
         body = next((
