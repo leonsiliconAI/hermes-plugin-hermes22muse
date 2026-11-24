@@ -5,14 +5,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from ._pythonmonkey import call
+
 CALLER = "hermes22muse"
 STAMP = f"⟦via muse-mcp · from {CALLER}⟧ "
 HISTORY_LIMIT = 50
-# An assistant row in one of these states is still being written; the relay waits for its final text.
-UNFINISHED = frozenset({
-    "pending", "queued", "running", "in_progress", "started", "active", "working", "streaming",
-    "generating",
-})
 
 
 class MuseError(Exception):
@@ -28,46 +25,10 @@ class Message:
 
 def history_messages(result, chat_id):
     """Project completed conversation rows from the Link's response envelope."""
-    if not result.get("ok") or not result.get("scoped_to_chat"):
-        raise MuseError("scoped history unavailable")
-    response = result.get("response")
-    for _ in range(5):
-        if not isinstance(response, dict) or response.get("ok") is False:
-            break
-        events = response.get("chat_events", response.get("events"))
-        if isinstance(events, list):
-            break
-        response = response.get("result", response.get("response"))
-    else:
-        raise MuseError("unrecognized Link history response")
-    if not isinstance(response, dict) or response.get("ok") is False:
-        raise MuseError("unrecognized Link history response")
-
-    messages = {}
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        name, payload = event.get("event_name"), event.get("payload")
-        if name not in ("message.user", "message.assistant") or not isinstance(payload, dict):
-            continue
-        session = payload.get("session_id") or event.get("session_id")
-        role = name.split(".")[1]
-        if (session and session != chat_id) or payload.get("role") not in (None, role):
-            continue
-        if False in (payload.get("display_text_ready"), event.get("display_text_ready")):
-            continue
-        if role == "assistant" and payload.get("status") in UNFINISHED:
-            continue
-        identifier = payload.get("message_id") or event.get("message_id") or payload.get("id")
-        body = next((
-            value for value in (
-                payload.get("display_text"), event.get("display_text"), payload.get("content"),
-                payload.get("text"),
-            ) if isinstance(value, str) and value.strip()
-        ), None)
-        if isinstance(identifier, str) and identifier and body:
-            messages[identifier] = Message(identifier, role, body)
-    return list(messages.values()), len(events) >= HISTORY_LIMIT
+    history = call(__file__, "history", result, chat_id, HISTORY_LIMIT)
+    if "error" in history:
+        raise MuseError(history["error"])
+    return [Message(**row) for row in history["messages"]], history["full"]
 
 
 class MuseChat:

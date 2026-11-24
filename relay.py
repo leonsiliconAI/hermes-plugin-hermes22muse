@@ -8,8 +8,8 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing, contextmanager
-from html import escape
 
+from ._pythonmonkey import acall, call
 from .muse import MuseError, STAMP
 
 LOG = logging.getLogger(__name__)
@@ -28,21 +28,11 @@ def marker(message_id):
 
 
 def slack_permalink(channel, ts):
-    return f"https://app.slack.com/archives/{channel}/p{ts.replace('.', '')}"
+    return call(__file__, "permalink", channel, ts)
 
 
 def slack_chunks(text):
-    # Slack recommends a 4,000-character limit. Reserve room for the label and escaping.
-    while text:
-        cut = min(len(text), 3400)
-        while len(escape(text[:cut], quote=False)) > 3400:
-            cut //= 2
-        if cut < len(text):
-            newline = text.rfind("\n", cut // 2, cut)
-            if newline >= 0:
-                cut = newline + 1
-        yield escape(text[:cut], quote=False)
-        text = text[cut:]
+    yield from call(__file__, "slackChunks", text)
 
 
 class Store:
@@ -166,15 +156,11 @@ class Store:
             for message in messages:
                 if message.id in known:
                     continue
-                if message.role == "user" and (
-                    message.id in echoed or message.text.startswith(STAMP + "[Hermes delivery ")
-                ):
-                    self._add_output(db, job_id, message.id, [None])
-                    continue
-                label = "Muse" if message.role == "assistant" else "You in Muse"
-                added |= self._add_output(db, job_id, message.id, [
-                    f"{label}\n{chunk}" for chunk in slack_chunks(message.text)
-                ])
+                parts = call(__file__, "slackDelivery",
+                             {"id": message.id, "role": message.role, "text": message.text},
+                             message.id in echoed, STAMP)
+                changed = self._add_output(db, job_id, message.id, parts)
+                added |= parts != [None] and changed
             if added:
                 db.execute("UPDATE handoffs SET activity=? WHERE id=?", (time.time(), job_id))
 
@@ -296,14 +282,7 @@ class Relay:
                     self.store.accepted(job_id, ts, message.id)
                     return
         self.store.attempted(job_id, ts)
-        if first:
-            request = slack_permalink(job["channel"], ts)
-            text = ("This side chat was opened for a Hermes request. Your chat replies are relayed "
-                    "to the matching Slack thread. Work on the request below and reply here.\n"
-                    f"Original Slack message: {request}\n\n"
-                    f"{entry['text']}")
-        else:
-            text = f"Follow-up from the linked Slack thread\n\n{entry['text']}"
+        text = await acall(__file__, "museDelivery", first, job["channel"], ts, entry["text"])
         if len((STAMP + prefix + text).encode("utf-8")) > 64 * 1024:
             text = text.encode("utf-8")[:60 * 1024].decode("utf-8", errors="ignore")
             text += f"\n\n[More text in the Slack message] {slack_permalink(job['channel'], ts)}"
@@ -342,11 +321,9 @@ class Relay:
                     messages, full = await muse.history(job_id)
                     self.store.collect(job_id, messages, full)
         except Exception as exc:
-            retry = min(300, 5 * 2 ** min(job["failures"], 6))
             headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
             retry_after = str(headers.get("Retry-After", headers.get("retry-after", "")))
-            if retry_after.isdigit():
-                retry = max(retry, int(retry_after))
+            retry = int(call(__file__, "retryDelay", job["failures"], retry_after))
             LOG.warning("hermes22muse: handoff %s retry in %ss (%s)", job_id, retry, type(exc).__name__)
             self.store.schedule(job, retry=retry)
         else:

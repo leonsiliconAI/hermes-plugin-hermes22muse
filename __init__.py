@@ -7,13 +7,12 @@ import os
 import re
 from contextlib import suppress
 
+from ._pythonmonkey import call
 from .muse import Muse
-from .relay import Relay, Slack, Store, slack_permalink
+from .relay import Relay, Slack, Store
 
 LOG = logging.getLogger(__name__)
 USER_ID = re.compile(r"[UW][A-Z0-9]+")
-TEAM_ID = re.compile(r"T[A-Z0-9]+")
-CHANNEL_ID = re.compile(r"[CDG][A-Z0-9]+")
 SLACK_TS = re.compile(r"[0-9]+\.[0-9]{6}")
 
 
@@ -42,17 +41,13 @@ def register(ctx):
             return None
         if thread and not SLACK_TS.fullmatch(thread):
             return None
-        body = text.strip() or (
-            "The Slack request has no text. Its original message is available at "
-            f"{slack_permalink(channel, message_id)}."
-        )
+        body = call(__file__, "requestBody", text, channel, message_id)
         if relay.store.enqueue(team, channel, thread, message_id, owner, body):
             return {"action": "handled"}
         return None
 
     def owns_slack_request(user, team, channel, message_id):
-        return bool(user == owner and TEAM_ID.fullmatch(team) and CHANNEL_ID.fullmatch(channel)
-                    and SLACK_TS.fullmatch(message_id or ""))
+        return call(__file__, "ownsRequest", user, owner, team, channel, message_id)
 
     def wire(_native, adapter):
         nonlocal relay

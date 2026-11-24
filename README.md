@@ -25,7 +25,7 @@ Set these values in the Hermes profile’s environment and install the plugin. O
 | `HERMES22MUSE_MCP_SECRET`    | The paired service’s `ORIGIN_SHARED_SECRET`                                      |
 
 ```sh
-hermes plugins install leonsiliconAI/hermes-plugin-hermes22muse --enable
+hermes plugins install leonsiliconAI/hermes-plugin-hermes22muse --enable --yes-deps
 ```
 
 If the same profile runs the AutoLinear Hermes plugin, update it to 1.4.6 or later. Its gateway intake yields to hermes22muse for the configured user. If the separate AutoLinear Slack app also subscribes to that user’s messages for fast intake, pause those subscriptions before enabling this integration so the Worker does not move or edit an original request ahead of Hermes.
