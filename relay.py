@@ -53,6 +53,9 @@ class Store:
                     part INTEGER NOT NULL, text TEXT,
                     UNIQUE(handoff, event, part)
                 );
+                CREATE TABLE IF NOT EXISTS muse_dm_threads (
+                    handoff TEXT PRIMARY KEY, channel TEXT NOT NULL, root TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS transcript (
                     seq INTEGER PRIMARY KEY, handoff TEXT NOT NULL, id TEXT NOT NULL,
                     role TEXT NOT NULL, text TEXT NOT NULL,
@@ -213,13 +216,27 @@ class Store:
     def pending_output(self, job_id):
         with self.connection() as db:
             return db.execute(
-                """SELECT * FROM outbound WHERE handoff=? AND text IS NOT NULL
-                   ORDER BY seq LIMIT 4""",
+                """WITH pending AS (
+                       SELECT o.seq, o.event, o.part, o.text,
+                              COALESCE(t.role='assistant', instr(o.text, 'Muse' || char(10))=1) AS from_muse
+                       FROM outbound o LEFT JOIN transcript t ON t.handoff=o.handoff AND t.id=o.event
+                       WHERE o.handoff=? AND o.text IS NOT NULL
+                   ), batches AS (
+                       SELECT *, row_number() OVER (PARTITION BY from_muse ORDER BY seq) AS position
+                       FROM pending
+                   )
+                   SELECT * FROM batches WHERE position<=4 ORDER BY seq""",
                 (job_id,),
             ).fetchall()
 
-    def delivered(self, seq):
+    def muse_dm_thread(self, job_id):
         with self.connection() as db:
+            return db.execute("SELECT channel, root FROM muse_dm_threads WHERE handoff=?", (job_id,)).fetchone()
+
+    def delivered(self, seq, muse_dm_root=None):
+        with self.connection() as db:
+            if muse_dm_root is not None:
+                db.execute("INSERT INTO muse_dm_threads(handoff, channel, root) VALUES (?, ?, ?)", muse_dm_root)
             db.execute("UPDATE outbound SET text=NULL WHERE seq=?", (seq,))
 
     def schedule(self, job, retry=None):
@@ -246,9 +263,53 @@ class Store:
         ).fetchone()
 
 
+class MuseSlackError(RuntimeError):
+    pass
+
+
 class Slack:
-    def __init__(self, adapter):
+    def __init__(self, adapter, muse_token):
         self.adapter = adapter
+        self._muse_token = muse_token
+        self._muse_client = None
+        self._muse_identity = None
+        self._muse_bot_id = None
+        self._auth_lock = asyncio.Lock()
+
+    def _new_muse_client(self):
+        from slack_sdk.web.async_client import AsyncWebClient
+
+        return AsyncWebClient(token=self._muse_token)
+
+    async def muse_client(self, team, hermes_client):
+        if not self._muse_token.startswith("xoxb-"):
+            raise MuseSlackError("set SLACK22MUSE_BOT_TOKEN to Muse's bot token")
+        if self._muse_token == getattr(hermes_client, "token", None):
+            raise MuseSlackError("SLACK22MUSE_BOT_TOKEN belongs to Hermes")
+        async with self._auth_lock:
+            if self._muse_identity is None:
+                client = self._new_muse_client()
+                auth = await asyncio.wait_for(client.auth_test(), 15)
+                if not (auth.get("ok") and auth.get("team_id") and auth.get("user_id") and auth.get("bot_id")):
+                    raise MuseSlackError("SLACK22MUSE_BOT_TOKEN must authenticate a workspace bot")
+                self._muse_identity = (auth["team_id"], auth["user_id"])
+                self._muse_bot_id = auth["bot_id"]
+                self._muse_client = client
+            muse_team, muse_user = self._muse_identity
+            if muse_team != team:
+                raise MuseSlackError("Muse is installed in a different Slack workspace")
+            if muse_user == getattr(self.adapter, "_team_bot_user_ids", {}).get(team):
+                raise MuseSlackError("SLACK22MUSE_BOT_TOKEN belongs to Hermes")
+            return self._muse_client
+
+    def is_muse_event(self, event):
+        source = event.source
+        if self._muse_identity is None or getattr(source.platform, "value", source.platform) != "slack":
+            return False
+        team, user = self._muse_identity
+        return source.scope_id == team and (
+            source.user_id == user or (event.raw_message or {}).get("bot_id") == self._muse_bot_id
+        )
 
     def client(self, job):
         channel, team = job["channel"], job["team"]
@@ -258,9 +319,22 @@ class Slack:
             raise RuntimeError("Slack workspace is disconnected")
         return self.adapter._get_client(channel, team_id=team)
 
-    async def post(self, job, text, key, thread):
-        channel = job["channel"]
+    async def post(self, job, text, key, from_muse, muse_dm):
+        channel, thread = job["channel"], job["root"]
         client = self.client(job)
+        if from_muse:
+            client = await self.muse_client(job["team"], client)
+            text = text.removeprefix("Muse\n")
+            if muse_dm is not None:
+                channel, thread = muse_dm
+            elif channel.startswith("D"):
+                # Slack only lets the participants post to a one-to-one DM.
+                text = call(__file__, "museDmOpening", text, channel, thread)
+                dm = await asyncio.wait_for(client.conversations_open(users=job["actor"]), 15)
+                channel = (dm.get("channel") or {}).get("id", "")
+                if not dm.get("ok") or not channel.startswith("D") or channel == job["channel"]:
+                    raise MuseSlackError("Slack did not open a separate Muse DM")
+                thread = None
         response = await asyncio.wait_for(client.chat_postMessage(
             channel=channel, text=text, thread_ts=thread, mrkdwn=False, link_names=False,
             unfurl_links=False, unfurl_media=False, client_msg_id=key,
@@ -269,9 +343,9 @@ class Slack:
             raise RuntimeError("Slack returned no matching send receipt")
         # Replies in the handoff thread reach Hermes even where channels require a mention.
         register = getattr(self.adapter, "_register_mentioned_thread", None)
-        if callable(register):
+        if channel == job["channel"] and callable(register):
             register(thread, job["team"])
-        return response["ts"]
+        return (job["id"], channel, response["ts"]) if thread is None else None
 
 
 class Relay:
@@ -292,14 +366,44 @@ class Relay:
             "clipUtf8": lambda text, limit: text.encode("utf-8")[:int(limit)].decode("utf-8", errors="ignore"),
         })
 
+    @staticmethod
+    def retry(job, exc):
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = str(headers.get("Retry-After", headers.get("retry-after", "")))
+        retry = int(call(__file__, "retryDelay", job["failures"], retry_after))
+        detail = str(exc) if isinstance(exc, MuseSlackError) else type(exc).__name__
+        code = (getattr(response, "data", None) or {}).get("error")
+        if code in {"channel_not_found", "not_in_channel", "missing_scope", "invalid_auth", "token_revoked"}:
+            detail += f": {code}"
+        LOG.warning("hermes22muse: handoff %s retry in %ss (%s)", job["id"], retry, detail)
+        return retry
+
+    async def flush_slack(self, job):
+        # Keep the Muse rows pending if its Slack app cannot post. Hermes's posts can still go out.
+        muse_retry = None
+        for item in self.store.pending_output(job["id"]):
+            from_muse = bool(item["from_muse"])
+            if from_muse and muse_retry is not None:
+                continue
+            key = operation_id(job["id"], hashlib.sha256(item["event"].encode()).hexdigest(), str(item["part"]))
+            muse_dm = self.store.muse_dm_thread(job["id"]) if from_muse and job["channel"].startswith("D") else None
+            try:
+                new_dm_root = await self.slack.post(job, item["text"], key, from_muse, muse_dm)
+            except Exception as exc:
+                if not from_muse:
+                    raise
+                muse_retry = self.retry(job, exc)
+            else:
+                self.store.delivered(item["seq"], new_dm_root)
+        return muse_retry
+
     async def tick(self, job):
-        job_id, root = job["id"], job["root"]
+        job_id = job["id"]
+        retry = None
         try:
             # Deliver durable thread posts even when the Muse connection is down.
-            for item in self.store.pending_output(job_id):
-                key = operation_id(job_id, hashlib.sha256(item["event"].encode()).hexdigest(), str(item["part"]))
-                await self.slack.post(job, item["text"], key, thread=root)
-                self.store.delivered(item["seq"])
+            retry = await self.flush_slack(job)
             async with asyncio.timeout(45):
                 async with self.muse.connect() as muse:
                     entry = self.store.next_inbound(job_id)
@@ -308,13 +412,8 @@ class Relay:
                     messages, full, busy = await muse.history(job_id)
                     self.store.collect(job_id, messages, full, busy)
         except Exception as exc:
-            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
-            retry_after = str(headers.get("Retry-After", headers.get("retry-after", "")))
-            retry = int(call(__file__, "retryDelay", job["failures"], retry_after))
-            LOG.warning("hermes22muse: handoff %s retry in %ss (%s)", job_id, retry, type(exc).__name__)
-            self.store.schedule(job, retry=retry)
-        else:
-            self.store.schedule(job)
+            retry = max(retry or 0, self.retry(job, exc))
+        self.store.schedule(job, retry=retry)
 
     async def run(self):
         with (self.store.directory / "relay.lock").open("a") as lock:

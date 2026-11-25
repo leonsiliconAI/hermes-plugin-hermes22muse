@@ -8,7 +8,7 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, call as mock_call, patch
 
 path = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("hermes22muse", path / "__init__.py")
@@ -21,6 +21,7 @@ from hermes22muse import relay as relay_module
 from hermes22muse.relay import Relay, Slack, Store, operation_id
 
 TEAM, CHANNEL, OWNER = "T001", "C001", "U001"
+BOT_TOKEN = "xoxb-muse-test"
 REQUEST, LATER = "1795000000.000001", "1795000002.000001"
 JOB = operation_id(TEAM, CHANNEL, REQUEST)
 
@@ -83,10 +84,16 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.store = Store(self.directory)
         self.adapter, self.client = fake_adapter()
         self.muse = FakeMuse()
-        self.relay = Relay(self.store, Slack(self.adapter), self.muse, OWNER)
+        _, self.muse_client = fake_adapter()
+        self.muse_client.auth_test = AsyncMock(return_value={
+            "ok": True, "team_id": TEAM, "user_id": "UMUSE", "bot_id": "BMUSE",
+        })
+        self.slack = Slack(self.adapter, BOT_TOKEN)
+        self.slack._new_muse_client = lambda: self.muse_client
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER)
 
-    def create(self, thread=REQUEST):
-        return self.store.create(TEAM, CHANNEL, REQUEST, thread, OWNER, "Task:\nFind a recipe",
+    def create(self, channel=CHANNEL):
+        return self.store.create(TEAM, channel, REQUEST, REQUEST, OWNER, "Task:\nFind a recipe",
                                  "Everything sent to Muse:\n\nTask:\nFind a recipe")
 
     async def tick(self):
@@ -101,8 +108,10 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_thread_under_request_holds_task_answer_and_follow_up(self):
         self.assertEqual(self.create(), JOB)
         self.assertIsNone(self.create(), "a second handoff for the same message")
+        self.adapter._register_mentioned_thread = register = Mock()
         await self.tick()
         self.assertEqual(posts(self.client), [(REQUEST, "Everything sent to Muse:\n\nTask:\nFind a recipe")])
+        self.assertEqual(register.call_args_list, [mock_call(REQUEST, TEAM)])
         self.assertEqual(self.muse.registrations, [JOB])
         self.assertTrue(self.muse.sends[0][1].endswith("Task:\nFind a recipe"))
         self.assertEqual(self.store.answer(JOB), ("working", []))
@@ -121,7 +130,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
         # A restarted gateway keeps the handoff; Hermes follows up and Leon also writes in Muse.
         self.store = Store(self.directory)
-        self.relay = Relay(self.store, Slack(self.adapter), self.muse, OWNER)
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER)
         self.store.follow_up(JOB, "Vegetarian, please", "Hermes → Muse\nVegetarian, please")
         await self.tick()
         self.assertTrue(self.muse.sends[1][1].endswith("]\nVegetarian, please"))
@@ -134,9 +143,18 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             {"from": "leon_in_muse", "text": "No mushrooms"}, {"from": "muse", "text": "Lentil soup"},
         ]))
         self.assertEqual(posts(self.client)[1:], [
-            (REQUEST, "Muse\nDo you want soup?"), (REQUEST, "Hermes → Muse\nVegetarian, please"),
-            (REQUEST, "You in Muse\nNo mushrooms"), (REQUEST, "Muse\nLentil soup"),
+            (REQUEST, "Hermes → Muse\nVegetarian, please"), (REQUEST, "You in Muse\nNo mushrooms"),
         ])
+        self.assertEqual(posts(self.muse_client), [
+            (REQUEST, "Do you want soup?"), (REQUEST, "Lentil soup"),
+        ])
+        self.muse_client.auth_test.assert_awaited_once()
+        event = SimpleNamespace(
+            source=SimpleNamespace(platform="slack", scope_id=TEAM, user_id="UMUSE"), raw_message={},
+        )
+        self.assertTrue(self.slack.is_muse_event(event))
+        event.source.user_id = OWNER
+        self.assertFalse(self.slack.is_muse_event(event))
         self.assertIsNone(self.store.next_inbound(JOB))
 
     async def test_receipt_lost_after_muse_acceptance_recovers_in_same_chat(self):
@@ -152,10 +170,61 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             db.execute("INSERT INTO handoffs(id, team, channel, request, actor, root, activity) "
                        "VALUES (?, ?, ?, ?, ?, ?, 0)", (JOB, TEAM, CHANNEL, REQUEST, OWNER, LATER))
             db.execute("INSERT INTO outbound(handoff, event, part, text) VALUES (?, 'old', 0, NULL)", (JOB,))
+            db.execute("INSERT INTO outbound(handoff, event, part, text) VALUES (?, 'legacy', 0, ?)",
+                       (JOB, "Muse\nPreviously queued"))
         self.muse.chats[JOB] = [Message("old", "assistant", "Already in Slack"), Message("new", "assistant", "New")]
         await self.tick()
         await self.tick()
-        self.assertEqual(posts(self.client), [(LATER, "Muse\nNew")])
+        self.assertEqual(posts(self.client), [])
+        self.assertEqual(posts(self.muse_client), [(LATER, "Previously queued"), (LATER, "New")])
+
+    async def test_muse_delivery_waits_for_its_workspace_while_hermes_can_follow_up(self):
+        self.create()
+        await self.tick()
+        self.muse.chats[JOB].append(Message("answer", "assistant", "Soup"))
+        await self.tick()
+        self.store.follow_up(JOB, "Vegetarian, please", "Hermes → Muse\nVegetarian, please")
+        self.muse_client.auth_test.return_value["team_id"] = "TOTHER"
+        await self.tick()
+        self.assertEqual(posts(self.muse_client), [])
+        self.assertEqual(posts(self.client)[-1], (REQUEST, "Hermes → Muse\nVegetarian, please"))
+        self.assertEqual([row["text"] for row in self.store.pending_output(JOB)], ["Muse\nSoup"])
+        self.assertTrue(self.muse.sends[-1][1].endswith("Vegetarian, please"))
+
+        self.muse_client.auth_test.return_value["team_id"] = TEAM
+        self.slack = Slack(self.adapter, BOT_TOKEN)
+        self.slack._new_muse_client = lambda: self.muse_client
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER)
+        await self.tick()
+        self.assertEqual(posts(self.muse_client), [(REQUEST, "Soup")])
+        self.assertEqual(self.store.pending_output(JOB), [])
+
+    async def test_muse_dm_links_to_the_handoff_and_preserves_its_thread_after_restart(self):
+        self.muse_client.conversations_open = AsyncMock(return_value={"ok": True, "channel": {"id": "DMUSE"}})
+        job = self.create(channel="D001")
+        await self.tick()
+        self.muse.chats[job].append(Message("answer", "assistant", "Soup"))
+        await self.tick()
+        self.settle()
+        await self.tick()
+        self.assertEqual(self.store.answer(job), ("answered", [{"from": "muse", "text": "Soup"}]))
+        self.assertEqual(len(posts(self.client)), 1)
+        opening = self.muse_client.chat_postMessage.await_args.kwargs
+        self.assertEqual(opening["channel"], "DMUSE")
+        self.assertIsNone(opening["thread_ts"])
+        self.assertEqual(opening["text"], "Soup\n\nOriginal Slack thread: https://app.slack.com/archives/D001/p1795000000000001")
+
+        self.store = Store(self.directory)
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER)
+        self.muse.chats[job].append(Message("second", "assistant", "Lentil soup"))
+        await self.tick()
+        await self.tick()
+        reply = self.muse_client.chat_postMessage.await_args.kwargs
+        self.assertEqual(reply["channel"], "DMUSE")
+        self.assertEqual(reply["thread_ts"], "1795000100.000001")
+        self.assertEqual(reply["text"], "Lentil soup")
+        self.muse_client.conversations_open.assert_awaited_once_with(users=OWNER)
+        self.assertEqual(self.store.pending_output(job), [])
 
     async def test_idle_handoffs_back_off_then_stop(self):
         self.create()

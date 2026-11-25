@@ -1,5 +1,5 @@
 name: hermes22muse
 label: hermes22muse
-version: 2.0.0
-description: Let Hermes hand Slack requests to Muse side chats, relay them in a thread and answer in the channel.
+version: 2.1.0
+description: Let Hermes hand Slack requests to Muse side chats, relay Muse’s replies through a dedicated Slack bot and answer in the channel.
 author: leonsilicon

@@ -81,6 +81,7 @@ def register(ctx):
     owner = os.getenv("HERMES22MUSE_SLACK_USER_ID", "").strip()
     url = os.getenv("HERMES22MUSE_MCP_URL", "").strip()
     secret = os.getenv("HERMES22MUSE_MCP_SECRET", "")
+    muse_token = os.getenv("SLACK22MUSE_BOT_TOKEN", "").strip()
     if not USER_ID.fullmatch(owner):
         LOG.warning("hermes22muse: set HERMES22MUSE_SLACK_USER_ID to enable Muse handoffs")
         return
@@ -146,13 +147,18 @@ def register(ctx):
         job = relay.store.find(current["scope_id"], current["chat_id"], thread=current["thread_id"]) if current["thread_id"] else None
         return call(__file__, "guideForTurn", current, owner, dict(job) if job else None)
 
+    def ignore_muse_delivery(event, **_):
+        if relay is not None and relay.slack.is_muse_event(event):
+            return {"action": "skip", "reason": "slack22muse transcript delivery"}
+        return None
+
     def wire(_native, adapter):
         nonlocal relay
         if getattr(adapter, "_hermes22muse_worker", None):
             return
         from hermes_constants import get_hermes_home
 
-        current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter), muse, owner)
+        current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter, muse_token), muse, owner)
         worker = asyncio.create_task(current.run())
         relay = current
         adapter._hermes22muse_worker = worker
@@ -185,3 +191,4 @@ def register(ctx):
                           check_fn=available, emoji=emoji)
     ctx.register_platform_handler("slack", wire)
     ctx.register_hook("pre_llm_call", guide)
+    ctx.register_hook("pre_gateway_dispatch", ignore_muse_delivery)

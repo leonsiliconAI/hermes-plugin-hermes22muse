@@ -90,12 +90,16 @@ function slackDelivery(message, echoed, stamp) {
 function sideChat(handoff) {
 	return "https://muse.ai/thread/" + handoff;
 }
+function museDmOpening(text, channel, thread) {
+	return text + "\n\nOriginal Slack thread: " + slackPermalink(channel, thread);
+}
 /** What Muse receives for a new handoff, and the thread post that shows all of it. */
 function handoffTexts(task, channel, ts, handoff) {
 	const muse = "Hermes, Leon's assistant, is handing you a task from Slack (" + slackPermalink(channel, ts) + "). Work on it in this chat and reply here. Hermes reads your replies, may follow up, and passes your final answer to Leon. Leon may also join this chat.\n\nTask:\n" + task;
+	const slackReply = channel.startsWith("D") ? "\nMuse will send replies in its own Slack DM." : "";
 	return {
 		muse,
-		thread: "Handed to Muse. Side chat: " + sideChat(handoff) + "\nEverything sent to Muse:\n\n" + muse
+		thread: "Handed to Muse. Side chat: " + sideChat(handoff) + slackReply + "\nEverything sent to Muse:\n\n" + muse
 	};
 }
 function followUpThread(text) {
@@ -108,15 +112,15 @@ function handoffGuide(owner) {
 		"2. If you can write a clear, self-contained task, call muse_handoff with it. Muse sees only that text, so include the goal, every relevant detail (names, links, IDs, earlier decisions, constraints) and what a good answer looks like. Don't do the task yourself first.",
 		"3. If the request is too vague for that, don't call muse_handoff. Ask Leon one specific clarifying question and mention <@" + owner + "> so he is pinged.",
 		"4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply; the exchange stays in that thread. If Muse is still working, call muse_wait.",
-		"5. When you are satisfied, give Leon the answer in your normal reply. It goes to the channel, not the thread.",
+		"5. When you are satisfied, give Leon a concise, checked answer in your normal reply. The Muse bot relays the transcript in the original channel thread or, for a DM with you, in its own DM with Leon. Keep your own reply focused on the outcome, any corrections, and what Leon needs to know.",
 		"Messages that ask for nothing (thanks, ok) and Hermes commands don't go to Muse."
 	].join("\n");
 }
 function threadGuide(handoff) {
-	return "[hermes22muse] This thread relays handoff " + handoff + " between you and Muse (side chat " + sideChat(handoff) + "), and Leon just wrote in it. If his message is for Muse or changes the task, pass it on with muse_reply, written so Muse can act on it, and judge Muse's answer before you reply to Leon. Muse's replies in this thread are posted by the relay.";
+	return "[hermes22muse] This thread relays handoff " + handoff + " between you and Muse (side chat " + sideChat(handoff) + "), and Leon just wrote in it. If his message is for Muse or changes the task, pass it on with muse_reply, written so Muse can act on it, and judge Muse's answer before you reply to Leon. The Muse bot posts Muse's messages in channel threads or in its own Slack DM with Leon. Keep your own reply focused on the checked outcome and any added context.";
 }
 const nextSteps = {
-	answered: "Check Muse's answer against Leon's request. If it is complete, reply to Leon with it (your reply goes to the channel). Otherwise follow up with muse_reply.",
+	answered: "Check Muse's answer against Leon's request. If it is complete, give Leon the checked outcome in your usual reply. Otherwise follow up with muse_reply.",
 	working: "Muse is still working. Call muse_wait to keep waiting.",
 	not_delivered: "Muse has not received the message yet (the Muse link may be down). Call muse_wait to keep waiting, or tell Leon it is queued."
 };
@@ -256,6 +260,7 @@ exports.guideForTurn = guideForTurn;
 exports.handoffGuide = handoffGuide;
 exports.handoffTexts = handoffTexts;
 exports.history = history;
+exports.museDmOpening = museDmOpening;
 exports.nextStep = nextStep;
 exports.ownsRequest = ownsRequest;
 exports.pollDelay = pollDelay;
