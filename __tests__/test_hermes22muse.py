@@ -310,9 +310,10 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
-        self.tools, self.hooks = {}, {}
+        self.tools, self.hooks, self.tool_options = {}, {}, {}
         ctx = SimpleNamespace(
-            register_tool=lambda name, handler, **kw: self.tools.__setitem__(name, handler),
+            register_tool=lambda name, handler, **kw: (self.tools.__setitem__(name, handler),
+                                                       self.tool_options.__setitem__(name, kw)),
             register_platform_handler=lambda platform, factory: setattr(ctx, "wire", factory),
             register_hook=lambda name, callback: self.hooks.__setitem__(name, callback),
         )
@@ -367,6 +368,11 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.pending_output(JOB)[-1]["text"], "Sent to Muse as you\nOnly the blockers")
         self.assertEqual(self.store.next_inbound(JOB)["text"], "Summarize LEON-1 and its open questions")
         self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
+
+    async def test_tools_are_always_listed(self):
+        # Hermes evaluates a check_fn before the Slack adapter wires the relay and keeps the result.
+        self.assertEqual(sorted(self.tools), ["muse_handoff", "muse_reply", "muse_wait"])
+        self.assertTrue(all("check_fn" not in options for options in self.tool_options.values()))
 
     async def test_waiting_tools_report_a_pending_approval(self):
         self.assertEqual(self.call("muse_handoff", task="Book the usual table for Friday")["status"], "not_delivered")

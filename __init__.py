@@ -190,11 +190,12 @@ def register(ctx):
         adapter.disconnect = disconnect_and_stop
         LOG.info("hermes22muse: Muse handoff relay registered")
 
-    available = lambda: relay is not None  # noqa: E731
+    # No check_fn: Hermes evaluates it once at startup, before the Slack adapter wires the relay,
+    # and keeps the tools hidden. Without the relay the tools return an error instead.
     for schema, handler, emoji in ((HANDOFF_SCHEMA, handoff_tool, "🪄"), (REPLY_SCHEMA, reply_tool, "↩️"),
                                    (WAIT_SCHEMA, wait_tool, "⏳")):
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler,
-                          check_fn=available, emoji=emoji)
+                          emoji=emoji)
     ctx.register_platform_handler("slack", wire)
     ctx.register_hook("pre_llm_call", guide)
     ctx.register_hook("pre_gateway_dispatch", ignore_muse_delivery)
