@@ -106,18 +106,17 @@ function followUpThread(text) {
 }
 function handoffGuide(owner) {
 	return [
-		"[hermes22muse] Leon has Muse, his personal AI, do the work on his Slack requests, with you as the one who hands it over and checks the result:",
-		"1. Work out what he is asking. Short messages such as \"continue\", \"do it\" or \"try again\" refer to earlier messages: read this conversation and, when needed, the channel's history, its Linear issue and the links there.",
-		"2. If you can write a clear, self-contained task, call muse_handoff with it. Muse receives it as a message from Leon himself, so write it the way he would type it to Muse: first person, short and direct, without mentioning yourself, Hermes, Slack, a relay or that you act for him. Muse sees only that text, so include the goal, every relevant detail (names, links, IDs, earlier decisions, constraints) and what a good answer looks like. Don't do the task yourself first.",
-		"3. If the request is too vague for that, don't call muse_handoff. Ask Leon one specific clarifying question and mention <@" + owner + "> so he is pinged.",
-		"4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply, also written as Leon; the exchange stays in that thread. If Muse is still working, call muse_wait. If it is waiting for Leon's approval, the result says how to answer it.",
-		"5. When you are satisfied, give Leon a concise, checked answer in your normal reply. The Muse bot relays the transcript in the original channel thread or, for a DM with you, in its own DM with Leon. Keep your own reply focused on the outcome, any corrections, and what Leon needs to know.",
-		"Messages that ask for nothing (thanks, ok) and Hermes commands don't go to Muse.",
-		"You can also work the Muse app itself as Leon: muse_approvals and muse_approve for what Muse asks him to approve, and muse_app_methods, muse_app and muse_file for its chats, tasks, goals, files, settings and connected apps."
+		"[Agent routing] For each task, decide which agents can help and dispatch them as needed. Handle routine work you can complete yourself. Combine agents when the task needs different capabilities, and keep ownership of the outcome.",
+		"Work out what Leon is asking from the conversation, channel history, Linear issue and relevant links. Interpret short follow-ups such as \"continue\" in that context. Ask one specific clarifying question and mention <@" + owner + "> if the missing information blocks progress.",
+		"- Use Grok Bot whenever the work requires a browser, including authenticated browser sessions. Send only the browser steps through grok_bot_send and bring the results back to the task.",
+		"- Use Muse for research, complex work and scheduled tasks. Use muse_handoff for the selected work, with a self-contained brief written in Leon's first person. Call muse_reply for follow-ups and muse_wait while Muse is working. Use muse_app_methods and muse_app to manage scheduled tasks in Muse.",
+		"- For work suited to a coding agent, use slack22orca_delegate on the MacBook when available. If it cannot take the task, find Silicon Dot with Beeper list_conversations on the chatgpt network and use send_message with the current Slack channel and root thread timestamp. Send a self-contained brief and ask Dot to start Codex in a cloud environment and return the private session link.",
+		"- In the cloud, complete what can be implemented and verified there. If a check needs a phone or other local hardware, preserve the branch or commit and exact verification steps. Once the cloud work is ready, queue the remaining check with slack22orca_delegate and target desktop so it waits for Orca on the MacBook or Mac mini. Keep the verification pending until it actually runs.",
+		"Check the agents' results, follow up where needed, and give Leon the outcome in this conversation. Acknowledge messages that ask for nothing without dispatching work."
 	].join("\n");
 }
 function threadGuide(handoff) {
-	return "[hermes22muse] This thread relays handoff " + handoff + " between you and Muse (side chat " + sideChat(handoff) + "), and Leon just wrote in it. If his message is for Muse or changes the task, pass it on with muse_reply, written as Leon himself would write it to Muse (first person, no mention of you or Hermes), and judge Muse's answer before you reply to Leon. The Muse bot posts Muse's messages in channel threads or in its own Slack DM with Leon. Keep your own reply focused on the checked outcome and any added context.";
+	return "[hermes22muse] This thread relays handoff " + handoff + " between you and Muse (side chat " + sideChat(handoff) + "), and Leon just wrote in it. If his message is for Muse or changes Muse's assignment, pass it on with muse_reply, written as Leon himself would write it to Muse (first person, no mention of you or Hermes), and judge Muse's answer before you reply to Leon. The Muse bot posts Muse's messages in channel threads or in its own Slack DM with Leon. Keep your own reply focused on the checked outcome and any added context.";
 }
 const nextSteps = {
 	answered: "Check Muse's answer against Leon's request. If it is complete, give Leon the checked outcome in your usual reply. Otherwise follow up with muse_reply, written as Leon.",
@@ -147,7 +146,7 @@ function slackTurn(current, owner) {
 	if (current?.platform === "slack" && ownsRequest(current.user_id, owner, current.scope_id, current.chat_id, current.message_id) && (!current.thread_id || current.thread_id === current.thread_id.trim() && timestamp.test(current.thread_id))) return current;
 }
 function guideForTurn(current, owner, existing) {
-	return { context: existing && existing.request !== current.message_id ? threadGuide(existing.id) : handoffGuide(owner) };
+	return { context: existing && existing.request !== current.message_id ? [handoffGuide(owner), threadGuide(existing.id)].join("\n\n") : handoffGuide(owner) };
 }
 function answerRows(job, receipt, rows, quiet) {
 	if (!job || !receipt) return {

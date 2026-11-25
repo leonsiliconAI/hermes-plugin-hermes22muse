@@ -23,7 +23,7 @@ WAIT = 330
 HANDOFF_SCHEMA = {
     "name": "muse_handoff",
     "description": (
-        "Hand Leon's current Slack request to Muse, his personal AI, in a new Muse side chat, and "
+        "Hand research or complex work from Leon's Slack request to Muse in a new side chat, and "
         "wait for Muse's answer. Posts a reply in a thread under Leon's message showing exactly what "
         "was sent; Muse's replies and your follow-ups appear in that thread. Muse sees nothing but "
         "`task`, so make it self-contained. Returns Muse's messages with status answered, status "
@@ -399,8 +399,8 @@ def register(ctx):
         worker = asyncio.create_task(current.run())
         relay = current
         adapter._hermes22muse_worker = worker
-        # AutoLinear's plugin moves these requests to their issue channels without its Codex handoff,
-        # and leaves replies in a handoff's thread where they are.
+        # Older AutoLinear versions use the ownership hook to skip direct Codex dispatch.
+        # The thread hook keeps replies in their existing Muse handoff.
         adapter._hermes22muse_owns_request = owns_slack_request
         adapter._hermes22muse_handoff_thread = (
             lambda team, channel, thread: current.store.find(team or "", channel or "", thread=thread)

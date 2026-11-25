@@ -1,13 +1,20 @@
 # hermes22muse
 
-Hermes hands its configured user's Slack requests to Meta Muse side chats, checks Muse's answers, and replies in the channel. It also [works the Muse app as the user](#the-muse-app): it answers Muse's approval requests and can call anything the app can.
+Hermes can hand research and complex work to Muse side chats, review Muse’s answers, and reply in Slack. It can also work the [Muse app](#the-muse-app) as the user, including creating and managing scheduled tasks.
 
-1. Hermes works out the request from the conversation. A short message such as "continue" becomes a full task built from the earlier messages, the channel and its links. If the request is too vague for a self-contained task, Hermes asks one clarifying question and mentions the user so they are pinged.
-2. `muse_handoff` opens a new side chat and sends the task as the user's own message: Hermes writes it the way the user would, in the first person, and Muse receives exactly that text, with no mention of Hermes, Slack or a relay. A reply in a thread under the user's message shows that text and links the side chat.
-3. The `slack22muse` app posts Muse’s replies as **Muse** in the original channel thread. For requests made in a one-to-one DM with Hermes, it opens a separate thread in the **Muse** DM and links back to the original request. Hermes checks them and sends follow-ups with `muse_reply`, also as the user, shown as "Sent to Muse as you". `muse_wait` keeps waiting when Muse needs more than about five minutes.
-4. Hermes gives a concise, reviewed answer in its normal reply. [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts channel answers at the top level.
+1. Hermes works out the request from the conversation and chooses the agents it needs. When it chooses Muse, Hermes writes a self-contained brief in the user’s own voice and sends it through `muse_handoff`.
+2. The `slack22muse` app posts Muse’s replies as **Muse** in the channel thread. For a one-to-one DM with Hermes, it opens a separate thread in the **Muse** DM and links back to the original request. Hermes checks the replies, sends follow-ups with `muse_reply`, and uses `muse_wait` when Muse needs more than about five minutes.
+3. Hermes gives a reviewed answer in its normal reply. [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts channel answers at the top level.
 
-A short guide is added to each of the user's Slack turns so Hermes follows these steps; the user's messages in a handoff thread get the thread's own guide. The guide does not outrank the profile's own instructions. If `SOUL.md` tells Hermes to delegate requests to other agents, add a rule there that the user's Slack requests go to Muse through `muse_handoff`, then run `hermes sessions refresh-prompts`. Without it, Hermes on Hermes Cloud answered through `delegate_task` instead. Messages you type directly in the side chat appear in Slack with a "You in Muse" label. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
+Replies in existing handoff threads keep their Muse context. Messages typed directly in the side chat appear in Slack with a “You in Muse” label. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
+
+## Agent routing
+
+The plugin adds routing guidance to the configured user’s Slack turns. Update the profile’s `SOUL.md` and any task-handling skills that still prescribe a default agent or mandatory handoff. Use the same policy for turns outside Slack and run `hermes sessions refresh-prompts` after changing the profile.
+
+> For each task, decide which agents can help and dispatch them as needed. Use Grok Bot whenever the work requires a browser, including signed-in sessions. Give Grok Bot only the browser steps. Use Muse for research, complex work, and scheduled tasks. Use Orca to start coding agents on the MacBook when it can take the task. Otherwise use a Codex cloud environment through ChatGPT Dots. Verify what you can in the cloud. If verification needs a phone or other local hardware, preserve the branch or commit and exact checks, then defer verification until Orca on the MacBook or Mac mini can run them.
+
+In Slack, use [slack22orca](../hermes-plugin-slack22orca/README.md) 1.1.0 or later for the MacBook handoff and to queue deferred checks with `target: desktop`. Use the [Beeper inbox](../../packages/ai/leonsilicon/services/beeper-inbox/README.md#agent-tasks-2026-11-21) to send a cloud handoff to Silicon Dot, and [slack22grokbot](../../packages/ai/leonsilicon/services/slack22grokbot/README.md) for browser steps.
 
 ## The Muse app
 
@@ -72,20 +79,20 @@ Use a Hermes gateway (v0.23.3 or later) with the native Slack adapter and the sl
 
 Set these values in the Hermes profile’s environment and install the plugin. On Hermes Cloud, use the profile’s Keys page.
 
-| Key                          | Value                                                                |
-| ---------------------------- | -------------------------------------------------------------------- |
-| `HERMES22MUSE_SLACK_USER_ID` | Slack user ID whose requests Hermes hands to the paired Muse account |
-| `HERMES22MUSE_MCP_URL`       | Private `https://…/mcp` or `http://127.0.0.1:7899/mcp`               |
-| `HERMES22MUSE_MCP_SECRET`    | The paired service’s `ORIGIN_SHARED_SECRET`                          |
-| `SLACK22MUSE_BOT_TOKEN`      | The slack22muse app’s Bot User OAuth Token (`xoxb-…`)                |
+| Key                          | Value                                                  |
+| ---------------------------- | ------------------------------------------------------ |
+| `HERMES22MUSE_SLACK_USER_ID` | Slack user ID allowed to use the paired Muse account   |
+| `HERMES22MUSE_MCP_URL`       | Private `https://…/mcp` or `http://127.0.0.1:7899/mcp` |
+| `HERMES22MUSE_MCP_SECRET`    | The paired service’s `ORIGIN_SHARED_SECRET`            |
+| `SLACK22MUSE_BOT_TOKEN`      | The slack22muse app’s Bot User OAuth Token (`xoxb-…`)  |
 
 ```sh
 hermes plugins install leonsiliconAI/hermes-plugin-hermes22muse --enable --yes-deps
 ```
 
-If the same profile runs the AutoLinear Hermes plugin, update it to 1.5.0 or later. Each request still gets its own Linear issue and channel, and Hermes hands it to Muse there instead of AutoLinear’s Codex handoff. Replies in a handoff’s thread stay in that thread. Keep the separate AutoLinear Slack app’s message event subscriptions paused: its Worker can’t tell such a reply from a new request outside an issue channel, so it would move the reply before Hermes sees it.
+If the profile runs AutoLinear, use 1.6.0 or later. AutoLinear creates the issue and channel, and Hermes decides how to handle the request there. Replies in a Muse handoff thread stay there. Keep the separate AutoLinear Slack app’s message event subscriptions paused so intake starts in the gateway and can recognize those replies.
 
-For an existing installation, run `hermes plugins update hermes22muse` after setting the key. Restart the gateway and look for `hermes22muse: Muse handoff relay registered`. Ask Hermes for something harmless in a channel it answers, check that the thread shows Hermes’s handoff and Muse’s reply under their respective names, and check that the answer arrives in the channel. For a DM request, check the separate conversation with Muse. Leave the gateway running for ongoing sync.
+For an existing installation, run `hermes plugins update hermes22muse` and restart the gateway. Look for `hermes22muse: Muse handoff relay registered`. Verify that a routine Slack request gets an answer without a Muse handoff, and that an explicit Muse research request relays the side chat in its thread. For a DM request sent to Muse, check the separate conversation with Muse.
 
 ## Delivery and recovery
 

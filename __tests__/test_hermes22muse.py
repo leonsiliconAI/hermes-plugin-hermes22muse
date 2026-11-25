@@ -401,6 +401,11 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         guide = self.hooks["pre_llm_call"](platform="slack")["context"]
         self.assertIn(f"mention <@{OWNER}>", guide)
         self.assertIn("muse_handoff", guide)
+        self.assertIn("Handle routine work you can complete yourself", guide)
+        self.assertIn("Send only the browser steps through grok_bot_send", guide)
+        self.assertIn("Use Muse for research, complex work and scheduled tasks", guide)
+        self.assertIn("Silicon Dot", guide)
+        self.assertIn("target desktop", guide)
         result = self.call("muse_handoff", task="Summarize LEON-1 and its open questions")
         self.assertEqual(result["status"], "not_delivered")
         self.assertEqual(result["handoff"], JOB)
