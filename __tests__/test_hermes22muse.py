@@ -447,7 +447,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
             platform="slack", scope_id=TEAM, chat_id=CHANNEL, user_id=OWNER), channel_prompt=None,
             raw_message={"user": OWNER, "thread_ts": REQUEST, "ts": LATER,
                          "client_msg_id": "de1e6a7e-c0de-4000-8000-000000000001",
-                         "text": "🤖 *Task slack:C001/1795000000.000001*: To Muse: Which constraints apply?"})
+                         "text": ":robot_face: *Task slack:C001/1795000000.000001*: To Muse: Which constraints apply?"})
         receive = self.hooks["pre_gateway_dispatch"]
         receive(event=event)
         self.assertIn("already delivered to the Muse queue", event.channel_prompt)

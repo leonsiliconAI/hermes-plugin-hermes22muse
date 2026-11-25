@@ -125,7 +125,7 @@ export function peerReport(event: {
   if (!group || !root || !ts || !timestamp.test(root) || !timestamp.test(ts) || root >= ts) return;
   const text = (event.text ?? "")
     .replace(/^\[Not Leon: [^\n]+\]\n/, "")
-    .replace(/^🤖 \*[^*\n]+\*:\s*/, "")
+    .replace(/^(?:🤖|:robot_face:)\s+\*[^*\n]+\*:\s*/, "")
     .trim();
   if (!text) return;
   const peer = /^To Muse:\s*([\s\S]+)/i.exec(text)?.[1]?.trim();
