@@ -11,6 +11,7 @@ from contextlib import suppress
 
 from ._pythonmonkey import blocking, call
 from .muse import Muse
+from .museweb import ROUTES, MuseApiError, MuseLoginRequired, MuseWeb, MuseWebError
 from .relay import Relay, Slack, Store, operation_id
 
 LOG = logging.getLogger(__name__)
@@ -73,6 +74,98 @@ WAIT_SCHEMA = {
         "additionalProperties": False,
     },
 }
+LEON_CONFIRMED = {
+    "type": "boolean",
+    "description": "Only true after Leon said yes to this exact action in this conversation.",
+}
+APPROVALS_SCHEMA = {
+    "name": "muse_approvals",
+    "description": (
+        "List what Muse is waiting for Leon to approve (the Muse app's \"Needs review\"): what it "
+        "asks, why, the details, and the choices Muse offers. With `handoff`, or in a handoff's "
+        "thread, only that side chat's requests. Read this before muse_approve."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "handoff": {"type": "string", "description": "Handoff ID returned by muse_handoff."},
+            "all": {"type": "boolean", "description": "List every chat's requests, not just this handoff's."},
+        },
+        "additionalProperties": False,
+    },
+}
+APPROVE_SCHEMA = {
+    "name": "muse_approve",
+    "description": (
+        "Answer one of Muse's approval requests as Leon, exactly as its Allow and Deny buttons do. "
+        "Allow only what Leon asked for: the right action, recipient or site, and content. "
+        "Payments, purchases and money transfers, password, login and security changes, and any "
+        "\"always\" choice are Leon's to decide: ask him, mentioning him, and wait for his yes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "approval": {"type": "string", "description": "The approval's ID from muse_approvals."},
+            "decision": {"type": "string", "enum": ["allow_once", "allow_always", "deny", "deny_always"]},
+            "leon_confirmed": LEON_CONFIRMED,
+        },
+        "required": ["approval", "decision"],
+        "additionalProperties": False,
+    },
+}
+METHODS_SCHEMA = {
+    "name": "muse_app_methods",
+    "description": (
+        "Find what the Muse app can do, to call with muse_app: chats and side chats, scheduled "
+        "tasks, goals, ideas, feed, files, memory, skills, connected apps, saved logins, "
+        "permissions, Muse Mail, browser tasks, voice, spaces, settings and more. Returns the "
+        "methods matching `query` with their paths and notes on their parameters."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "Words to look for, such as \"tasks\" or \"session rename\"."}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+APP_SCHEMA = {
+    "name": "muse_app",
+    "description": (
+        "Do anything Leon can do in the Muse app, as Leon: call one of its methods (find them with "
+        "muse_app_methods) on his Muse. `params` fills the path's {names}; the rest is the query "
+        "for a GET and the JSON body otherwise. For Leon's requests, still hand the work to Muse "
+        "with muse_handoff; use this to look at or manage Muse itself. Actions that erase data, "
+        "share his account or change what Muse may do unasked need his yes first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "method": {"type": "string", "description": "A method name, such as tasks.list."},
+            "params": {"type": "object", "description": "The method's parameters.", "additionalProperties": True},
+            "listen_seconds": {"type": "number", "description": "For *.subscribe methods: collect events for this long (at most 60)."},
+            "leon_confirmed": LEON_CONFIRMED,
+        },
+        "required": ["method"],
+        "additionalProperties": False,
+    },
+}
+FILE_SCHEMA = {
+    "name": "muse_file",
+    "description": (
+        "Download a file Muse made or holds (a `sandbox://workspace/…` path, a media URL from a "
+        "message, or a path on the Muse computer) and return where it was saved here."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}
+# The most a tool returns to Hermes, in characters of JSON.
+ANSWER_LIMIT = 60_000
+SIGN_IN = ("Hermes's muse.ai login is missing or has expired, so it cannot reach the Muse app. "
+           "Leon has to sign in again (hermes22muse README, \"Sign Hermes in to muse.ai\").")
 
 
 def session():
@@ -97,6 +190,110 @@ def register(ctx):
         return
 
     relay = None
+    web = None
+
+    def app():
+        nonlocal web
+        if web is None:
+            from hermes_constants import get_hermes_home
+
+            web = MuseWeb(get_hermes_home() / "hermes22muse")
+        return web
+
+    def app_tool(work):
+        """Run a tool that talks to the Muse app, turning its failures into answers Hermes can act on."""
+        try:
+            # These tools act as Leon, so a message from anyone else (a bot's post, a forwarded
+            # email) never reaches them. Sessions with no chat platform are Leon's own jobs.
+            current = session()
+            if current.get("platform") and not call(__file__, "slackTurn", current, owner):
+                return json.dumps({"error": "The Muse app tools only work on Leon's own requests."})
+            return json.dumps(call(__file__, "clipAnswer", work(app()), ANSWER_LIMIT))
+        except MuseLoginRequired:
+            return json.dumps({"error": SIGN_IN})
+        except MuseApiError as exc:
+            return json.dumps({"error": f"Muse refused it ({exc.status}).", "muse_says": exc.body[:2000]})
+        except (MuseWebError, TimeoutError, OSError) as exc:
+            return json.dumps({"error": f"Could not reach the Muse app: {exc or type(exc).__name__}"})
+
+    def handoff_chat(args):
+        """The side chat to list approvals for: the named handoff's, or the current thread's."""
+        if args.get("all") or relay is None:
+            return None
+        if args.get("handoff"):
+            row = relay.store.handoff(str(args["handoff"]).strip())
+            return row["id"] if row is not None and row["actor"] == owner else None
+        try:
+            current = call(__file__, "slackTurn", session(), owner)
+        except Exception:
+            return None
+        if current is None:
+            return None
+        row = relay.store.find(current["scope_id"], current["chat_id"], current["message_id"], current["thread_id"])
+        return row["id"] if row is not None else None
+
+    def approvals_tool(args, **_):
+        chat = handoff_chat(args)
+        return app_tool(lambda muse: call(
+            __file__, "approvalList", muse.call("egress.approvals")["body"], chat))
+
+    def approve_tool(args, **_):
+        def decide(muse):
+            plan = call(__file__, "approvalDecide", muse.call("egress.approvals")["body"],
+                        str(args.get("approval") or ""), str(args.get("decision") or ""),
+                        args.get("leon_confirmed") is True)
+            if "error" in plan:
+                return plan
+            answer = muse.call("egress.approval.decide", plan["params"])["body"]
+            LOG.info("hermes22muse: answered approval %s with %s", plan["params"]["approval_id"],
+                     plan["params"]["decision"])
+            status = ((answer or {}).get("approval") or {}).get("status") if isinstance(answer, dict) else None
+            return {"decided": plan["params"]["decision"], "status": status, "approval": plan["summary"]}
+
+        return app_tool(decide)
+
+    def methods_tool(args, **_):
+        return json.dumps(call(__file__, "methodSearch", list(ROUTES.values()), str(args.get("query") or "")))
+
+    def app_method_tool(args, **_):
+        method = str(args.get("method") or "").strip()
+        refusal = call(__file__, "methodGuard", method, args.get("leon_confirmed") is True)
+        if refusal:
+            return json.dumps({"error": refusal})
+        if method not in ROUTES:
+            return json.dumps({"error": f"Muse has no method {method!r}. Find one with muse_app_methods."})
+        listen = args.get("listen_seconds")
+        listen = min(max(float(listen), 1), 60) if isinstance(listen, (int, float)) and listen else None
+
+        def run(muse):
+            answer = muse.call(method, args.get("params") or {}, listen=listen)
+            if isinstance(answer["body"], bytes):
+                answer["body"] = save_file(method.replace(".", "-"), answer["type"], answer["body"])
+            return answer["body"]
+
+        return app_tool(run)
+
+    def save_file(name, kind, data):
+        import mimetypes
+        from hermes_constants import get_hermes_home
+
+        folder = get_hermes_home() / "hermes22muse" / "files"
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stem = re.sub(r"[^\w.-]+", "_", name).strip("._")[-80:] or "file"
+        if "." not in stem:
+            stem += mimetypes.guess_extension(kind) or ".bin"
+        path = folder / f"{int(time.time())}-{stem}"
+        path.write_bytes(data)
+        return {"saved": str(path), "type": kind, "bytes": len(data)}
+
+    def file_tool(args, **_):
+        path = str(args.get("path") or "").strip()
+
+        def download(muse):
+            kind, data = muse.download(path)
+            return save_file(path.rsplit("/", 1)[-1], kind, data)
+
+        return app_tool(download)
 
     def owns_slack_request(user, team, channel, message_id):
         return call(__file__, "ownsRequest", user, owner, team or "", channel or "", message_id)
@@ -130,7 +327,12 @@ def register(ctx):
                 "logHandoff": lambda channel, message, job: LOG.info(
                     "hermes22muse: handed %s:%s to Muse as %s", channel, message, job),
             }
-        return json.dumps(call(__file__, "runTool", host, name, args, session() if store else None, owner, WAIT))
+        signed_in = app().signed_in() if store else False
+        result = call(__file__, "runTool", host, name, args, session() if store else None, owner, WAIT, signed_in)
+        if result.get("status") == "waiting_for_approval" and signed_in:
+            listed = json.loads(approvals_tool({"handoff": result["handoff"]}))
+            result["approvals"] = listed.get("approvals", listed)
+        return json.dumps(result)
 
     def handoff_tool(args, **_):
         return run_tool("handoff", args)
@@ -164,7 +366,7 @@ def register(ctx):
             return
         from hermes_constants import get_hermes_home
 
-        current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter, muse_token), muse, owner)
+        current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter, muse_token), muse, owner, app())
         worker = asyncio.create_task(current.run())
         relay = current
         adapter._hermes22muse_worker = worker
@@ -198,7 +400,9 @@ def register(ctx):
     # No check_fn: Hermes evaluates it once at startup, before the Slack adapter wires the relay,
     # and keeps the tools hidden. Without the relay the tools return an error instead.
     for schema, handler, emoji in ((HANDOFF_SCHEMA, handoff_tool, "🪄"), (REPLY_SCHEMA, reply_tool, "↩️"),
-                                   (WAIT_SCHEMA, wait_tool, "⏳")):
+                                   (WAIT_SCHEMA, wait_tool, "⏳"), (APPROVALS_SCHEMA, approvals_tool, "🛡️"),
+                                   (APPROVE_SCHEMA, approve_tool, "✅"), (METHODS_SCHEMA, methods_tool, "🧭"),
+                                   (APP_SCHEMA, app_method_tool, "🎛️"), (FILE_SCHEMA, file_tool, "📎")):
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler,
                           emoji=emoji)
     ctx.register_platform_handler("slack", wire)

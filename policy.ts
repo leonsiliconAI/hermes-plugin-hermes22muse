@@ -173,6 +173,7 @@ export function handoffGuide(owner: string) {
     "4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply, also written as Leon; the exchange stays in that thread. If Muse is still working, call muse_wait. If it is waiting for Leon's approval, the result says how to answer it.",
     "5. When you are satisfied, give Leon a concise, checked answer in your normal reply. The Muse bot relays the transcript in the original channel thread or, for a DM with you, in its own DM with Leon. Keep your own reply focused on the outcome, any corrections, and what Leon needs to know.",
     "Messages that ask for nothing (thanks, ok) and Hermes commands don't go to Muse.",
+    "You can also work the Muse app itself as Leon: muse_approvals and muse_approve for what Muse asks him to approve, and muse_app_methods, muse_app and muse_file for its chats, tasks, goals, files, settings and connected apps.",
   ].join("\n");
 }
 
@@ -198,6 +199,13 @@ const nextSteps: Record<string, string> = {
     "Muse has not received the message yet (the Muse link may be down). Call muse_wait to keep " +
     "waiting, or tell Leon it is queued.",
   waiting_for_approval:
+    "Muse is waiting for Leon's approval in this side chat. Answer it the way Leon would: read the " +
+    "request in this result's `approvals` (or call muse_approvals with this handoff). Apply Leon's " +
+    "approval rule: if it does what he asked for (the right action, recipient or site, and content), " +
+    "call muse_approve with allow_once and say in the Slack thread what you approved; otherwise deny " +
+    "it or ask Leon, mentioning him. Payments, purchases, money transfers and password, login or " +
+    'security changes always go to Leon, as does any "always" choice. Then call muse_wait.',
+  waiting_for_approval_beeper:
     "Muse is waiting for Leon's approval in this side chat. Answer it the way Leon would, through " +
     "Beeper: find Muse's request on the muse network (list_conversations, then list_messages), the " +
     'newest message like "Muse is waiting for your approval: … Allow it once with `!muse ' +
@@ -209,8 +217,9 @@ const nextSteps: Record<string, string> = {
     "within a minute, tell Leon what Muse is waiting for and mention him. Then call muse_wait.",
 };
 
-export function nextStep(status: string) {
-  return nextSteps[status] ?? "";
+/** `app` says whether Hermes can reach Muse's own app gateway; without it approvals go through Beeper. */
+export function nextStep(status: string, app = true) {
+  return nextSteps[status === "waiting_for_approval" && !app ? status + "_beeper" : status] ?? "";
 }
 
 // Poll a handoff often while it is in use, then back off; one idle for a day stops polling.
@@ -358,6 +367,7 @@ export async function runTool(
   session: SlackTurn | undefined,
   owner: string,
   seconds: number,
+  app = true,
 ) {
   if (!host) return { error: "The Muse relay is not running in this gateway." };
   const current = slackTurn(session, owner);
@@ -420,7 +430,7 @@ export async function runTool(
         slack_thread: slackPermalink(job.channel, job.root),
         messages: answer.messages,
         ...(decision === "pending" ? { approvals_pending: approvals.count } : {}),
-        next: nextStep(status),
+        next: nextStep(status, app),
       };
     if (decision === "check") await host.wantApprovals(job.id);
     else if (polls % 3 === 0) await host.touch(job.id);
@@ -540,4 +550,308 @@ export function directoryRegistration(current: DirectoryEntry) {
   if (current.entry) return { error: "side chat ID is already present in Muse's registry" };
   const revision = current.directory_revision || current.revision;
   return revision ? { revision } : { error: "Muse directory revision unavailable" };
+}
+
+// --- Muse's app gateway: approvals and every other method of the Muse app ---
+
+interface PreviewBlock {
+  type?: string;
+  label?: string | null;
+  text?: string;
+  rows?: { label?: string; value?: string }[];
+  items?: { label?: string; url?: string }[];
+}
+
+interface RawApproval {
+  approval_id?: string;
+  approval_type?: string;
+  status?: string;
+  requested_at_ms?: number;
+  request_expires_at_ms?: number;
+  session_id?: string;
+  message_revision?: number;
+  decision_options?: { kind?: string; label_text?: string; label?: { scope?: string } }[];
+  display?: {
+    display_name?: string;
+    card_title?: string;
+    summary_title?: string;
+    permission_question?: { kind?: string; text?: string };
+    scope_summary?: string;
+    purpose_summary?: string;
+    reason?: string;
+    request_preview_document?: { blocks?: PreviewBlock[] };
+  };
+  scope?: Record<string, unknown>;
+  payload?: {
+    type?: string;
+    connector_payload?: { host?: string; method?: string; path?: string };
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+const moneyWords = /purchase|checkout|payment|wallet|order|refund|transfer|subscription/i;
+
+function assistantName(text: string | undefined) {
+  return (text ?? "").replaceAll("{assistant}", "Muse");
+}
+
+function previewLines(blocks: PreviewBlock[] | undefined) {
+  const lines: string[] = [];
+  for (const block of blocks ?? []) {
+    for (const row of block.rows ?? []) lines.push((row.label ?? "") + ": " + (row.value ?? ""));
+    if (block.text) lines.push((block.label ? block.label + ": " : "") + block.text);
+    for (const item of block.items ?? []) lines.push((item.label ?? "") + " " + (item.url ?? ""));
+  }
+  return lines.map((line) => line.slice(0, 2000)).slice(0, 40);
+}
+
+/** The side chat an approval belongs to, wherever this Muse version records it. */
+function approvalChat(approval: RawApproval) {
+  const scope = approval.scope ?? {};
+  for (const value of [
+    approval.session_id,
+    scope.session_id,
+    scope.thread_id,
+    (scope.session as { id?: unknown } | undefined)?.id,
+    (scope.thread as { id?: unknown } | undefined)?.id,
+  ])
+    if (typeof value === "string" && value) return value;
+}
+
+/** Whether Leon has to decide: it spends money, or the request doesn't say what it is. */
+function approvalNeedsLeon(approval: RawApproval) {
+  const display = approval.display ?? {};
+  const question = display.permission_question?.kind ?? "";
+  if (moneyWords.test(approval.approval_type ?? "") || moneyWords.test(question))
+    return "it spends or moves money";
+  for (const key of Object.keys(approval))
+    if (/checkout|payment/i.test(key) && approval[key]) return "it spends or moves money";
+  if (!display.card_title && !display.permission_question?.text)
+    return "it does not say what it allows";
+}
+
+export function approvalSummary(approval: RawApproval) {
+  const display = approval.display ?? {};
+  const connector = approval.payload?.connector_payload;
+  const leon = approvalNeedsLeon(approval);
+  return {
+    approval: approval.approval_id,
+    side_chat_id: approvalChat(approval),
+    asks: assistantName(display.card_title || display.permission_question?.text),
+    kind: display.permission_question?.kind ?? approval.approval_type ?? approval.payload?.type,
+    summary: assistantName(display.scope_summary || display.summary_title),
+    purpose: display.purpose_summary || display.reason,
+    details: previewLines(display.request_preview_document?.blocks),
+    target: connector
+      ? [display.display_name, connector.host, connector.method].filter(Boolean).join(" · ")
+      : display.display_name,
+    options: (approval.decision_options ?? []).map((option) => ({
+      decision: option.kind,
+      label: option.label_text,
+      ...(option.label?.scope ? { scope: option.label.scope } : {}),
+    })),
+    requested: approval.requested_at_ms
+      ? new Date(approval.requested_at_ms).toISOString()
+      : undefined,
+    expires: approval.request_expires_at_ms
+      ? new Date(approval.request_expires_at_ms).toISOString()
+      : undefined,
+    ...(leon ? { leon_decides: leon } : {}),
+  };
+}
+
+function pendingApprovals(response: unknown): RawApproval[] {
+  const body = (response ?? {}) as {
+    pending_approvals?: unknown;
+    pending?: unknown;
+    approvals?: unknown;
+  };
+  const list = body.pending_approvals ?? body.pending ?? body.approvals;
+  return Array.isArray(list)
+    ? list.filter(
+        (item) => item && typeof item === "object" && (item.status ?? "pending") === "pending",
+      )
+    : [];
+}
+
+/**
+ * Muse's pending approvals. With a side chat, the ones that belong to it; approvals that name no
+ * chat are included, since they may be that chat's.
+ */
+export function approvalList(response: unknown, chat?: string) {
+  const all = pendingApprovals(response);
+  const mine = chat
+    ? all.filter((approval) => {
+        const owner = approvalChat(approval);
+        return !owner || owner === chat;
+      })
+    : all;
+  return { approvals: mine.map(approvalSummary), pending_in_all_chats: all.length };
+}
+
+const decisions = ["allow_once", "allow_always", "deny", "deny_always"];
+
+/** The request that answers an approval, or the reason Hermes may not send it. */
+export function approvalDecide(
+  response: unknown,
+  id: string,
+  decision: string,
+  leonConfirmed: boolean,
+) {
+  const approval = pendingApprovals(response).find((item) => item.approval_id === id);
+  if (!approval)
+    return { error: "No pending approval has that ID. Call muse_approvals for the current ones." };
+  if (!decisions.includes(decision))
+    return { error: "decision must be one of " + decisions.join(", ") + "." };
+  const option = (approval.decision_options ?? []).find((item) => item.kind === decision);
+  if (!option)
+    return {
+      error:
+        "Muse does not offer " +
+        decision +
+        " here. Its options: " +
+        (approval.decision_options ?? []).map((item) => item.kind).join(", ") +
+        ".",
+    };
+  const allowing = decision.startsWith("allow");
+  const reason = allowing ? approvalNeedsLeon(approval) : undefined;
+  const standing = decision.endsWith("_always")
+    ? "it changes what Muse may do from now on"
+    : undefined;
+  if ((reason || standing) && !leonConfirmed)
+    return {
+      error:
+        "Leon decides this one (" +
+        (reason ?? standing) +
+        "). Tell him exactly what Muse asks, mention him, and send it with leon_confirmed only after he says yes in this conversation.",
+    };
+  const scope = option.label?.scope;
+  return {
+    params: {
+      approval_id: id,
+      decision,
+      ...(decision.endsWith("_always") && scope ? { always_scope: scope } : {}),
+      ...(decision === "allow_always" && scope ? { allow_always_scope: scope } : {}),
+      ...(approval.message_revision === undefined
+        ? {}
+        : { expected_message_revision: approval.message_revision }),
+    },
+    summary: approvalSummary(approval),
+  };
+}
+
+interface Route {
+  method: string;
+  http: string;
+  path: string;
+}
+
+// What the Muse app sends for the methods Hermes is most likely to need. Other methods take the
+// path's {names} plus the fields the app sends; a wrong shape comes back as Muse's own error text.
+const methodNotes: Record<string, string> = {
+  "chat.stream":
+    'Send a message: {items: [{type: "text", text}], node_id: "hermes", capabilities: {}, session_id?} (session_id = side chat; omit for the main chat). The reply arrives in chat.history.',
+  "chat.history":
+    "{session_id?, limit}. Rows have event_name message.user / message.assistant and delta.presentation (files, images, links, browser tasks).",
+  "chat.cancel": "Stop Muse's current turn: {session_id?}.",
+  "session.start":
+    '{origin: "fresh", lifecycle: "persistent"}; then session.rename {session_id, title}.',
+  "sessions.list": "Every chat with its ID, title and state.",
+  "egress.approvals": "Use muse_approvals and muse_approve instead.",
+  "egress.approval.history": "{limit, cursor?}: approvals already decided.",
+  "egress.permissions": "What Muse may do without asking.",
+  "tasks.list":
+    "Scheduled tasks. tasks.runs {limit, job_id?}; tasks.run / tasks.pause / tasks.resume / tasks.delete {job_id}.",
+  "goals.list": "goals.get {id}, goals.update {id, …}, goals.delete {id}.",
+  "api.idea-cards.list":
+    'Ideas. api.idea-cards.execute {ideaCardId, mode: "full"} has Muse act on one.',
+  "feed.list": '{limit}. feed.unit.reaction {unit_id, reaction: "like" | "love" | "dislike"}.',
+  "fs.list":
+    "Files on the Muse computer: {path}. fs.read {path}, fs.write {path, content}, fs.search {query}. Use muse_file to download one.",
+  "connectors.list": "Connected apps. connectors.get {id}, connectors.disconnect {id}.",
+  "credentials.list": "Saved logins in Muse's secure store (names only, never passwords).",
+  "memory.search": "{query}: what Muse remembers.",
+  "skills.list": "Muse's skills. skills.set_disabled {…}.",
+  "email.threads.list":
+    "Muse Mail: {cursor?}. email.threads.get {thread_id}, email.messages.get {message_id}.",
+  "widgets.state.set": "Answer a quick-reply widget in a message: {widget_id, …}.",
+  "browser_task.get": "{task_id}: a browser task's state. browser_task.stop {task_id} ends it.",
+  "config.get": "Muse's settings. config.update takes the changed fields.",
+  "model.get": "The model Muse uses. model.set changes it.",
+  identity: "Who Muse is and whose it is.",
+};
+
+// Actions that erase data, open the account to others, or change what Muse may do unasked.
+const leonOnly =
+  /^(bootstrap\.reset|onboarding\.reset|voice\.onboarding\.reset|api\.ideas\.reset|dyi\.export|rv_migration\.|ssh\.|redteam\.|node\.unpair|browser\.cookies\.clear|email\.mailbox\.(delete|create)|email\.(owners\.revoke|owner_challenges\.)|wallet\.set|subscription\.|appeals\.submit|credentials\.(register|capture|delete|catalog\.(update|delete))|custom_connectors\.(register|delete)|(egress\.)?permissions\.(?!active$|inventory$|settings$|scoped$)|egress\.approval\.(decide|edit_message)|peers\.(invites\.(create|accept)|requests\.(confirm|sas\.confirm)|connections\.connect|disconnect)|shared_agents\.(delete|shares\.create)|spaces\.(share$|audience\.set)|peerSpaces\.share$)/;
+
+export function methodGuard(method: string, leonConfirmed: boolean) {
+  if (method === "egress.approval.decide")
+    return "Answer approvals with muse_approve, which checks the request first.";
+  if (leonOnly.test(method) && !leonConfirmed)
+    return (
+      method +
+      " erases data, shares Leon's account or changes what Muse may do on its own. Ask Leon first, mentioning him, and pass leon_confirmed only after he says yes in this conversation."
+    );
+}
+
+export function methodSearch(routes: Route[], query: string) {
+  const words = query
+    .toLowerCase()
+    .split(/[^a-z0-9_]+/)
+    .filter(Boolean);
+  const scored = routes
+    .map((route) => {
+      const text = (
+        route.method +
+        " " +
+        route.path +
+        " " +
+        (methodNotes[route.method] ?? "")
+      ).toLowerCase();
+      const score =
+        words.filter((word) => text.includes(word)).length + (methodNotes[route.method] ? 0.5 : 0);
+      return { route, score };
+    })
+    .filter((item) => !words.length || item.score >= 1)
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.route.method.localeCompare(right.route.method),
+    );
+  return {
+    total: routes.length,
+    methods: scored.slice(0, 40).map(({ route }) => ({
+      method: route.method,
+      call: route.http + " " + route.path,
+      ...(methodNotes[route.method] ? { note: methodNotes[route.method] } : {}),
+      ...(leonOnly.test(route.method) ? { leon_confirms: true } : {}),
+    })),
+  };
+}
+
+/** A tool result small enough for Hermes to read: long text and long lists are cut and say so. */
+export function clipAnswer(value: unknown, limit: number): unknown {
+  const text = JSON.stringify(value) ?? "null";
+  if (text.length <= limit) return value;
+  if (Array.isArray(value)) {
+    const kept: unknown[] = [];
+    let size = 2;
+    for (const item of value) {
+      size += (JSON.stringify(item) ?? "").length + 1;
+      if (size > limit) break;
+      kept.push(item);
+    }
+    if (kept.length) return { truncated: true, shown: kept.length, of: value.length, items: kept };
+  }
+  return { truncated: true, bytes: text.length, start: text.slice(0, limit) };
+}
+
+export function loginEndedNotice(owner: string) {
+  return (
+    "<@" +
+    owner +
+    "> muse.ai signed me out, so I can no longer answer Muse's approvals or use the Muse app for you. " +
+    'Handoffs to Muse still work. Sign me in again when you can: the steps are in the hermes22muse README under "Sign Hermes in to muse.ai".'
+  );
 }

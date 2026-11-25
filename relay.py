@@ -16,6 +16,8 @@ MAX_WORKERS = 8
 # Muse counts as done after a completed reply and this long without new rows or unfinished replies,
 # as muse-mcp's own muse_chat_ask does: agentic work can continue after a first answer.
 QUIET = 8
+# How often the relay looks at Hermes's muse.ai login, which it extends every few hours.
+LOGIN_CHECK = 900
 # A handoff idle for a day stops polling (policy.ts pollDelay).
 SLEEP = 10 * 365 * 86400
 
@@ -378,8 +380,45 @@ class Slack:
 
 
 class Relay:
-    def __init__(self, store, slack, muse, actor):
-        self.store, self.slack, self.muse, self.actor = store, slack, muse, actor
+    def __init__(self, store, slack, muse, actor, web=None):
+        self.store, self.slack, self.muse, self.actor, self.web = store, slack, muse, actor, web
+
+    async def pending_approvals(self, muse, job_id):
+        """Muse's pending approvals for a side chat: from its app gateway, else muse-mcp's snapshot."""
+        if self.web is not None and self.web.signed_in():
+            try:
+                answer = await asyncio.to_thread(self.web.call, "egress.approvals")
+                return len(call(__file__, "approvalList", answer["body"], job_id)["approvals"])
+            except Exception as exc:
+                LOG.warning("hermes22muse: could not read approvals from the Muse app (%s)", exc or type(exc).__name__)
+        return await muse.pending_approvals(job_id)
+
+    async def keep_login(self):
+        """Extend Hermes's muse.ai login while it is valid, and tell the user once when it ends."""
+        from .museweb import MuseLoginRequired
+
+        login = self.web.login
+        try:
+            saved = login.read()
+            if not (saved.get("cookies") or {}).get("hatch_sess") or saved.get("told"):
+                return
+            if not saved.get("expired"):
+                await asyncio.to_thread(self.web.keep_alive)
+                return
+        except MuseLoginRequired:
+            pass
+        except Exception as exc:
+            LOG.warning("hermes22muse: could not extend the muse.ai login (%s)", exc or type(exc).__name__)
+            return
+        team, client = next(iter(self.slack.adapter._team_clients.items()), (None, None))
+        if client is None:
+            return
+        opened = await asyncio.wait_for(client.conversations_open(users=self.actor), 15)
+        await asyncio.wait_for(client.chat_postMessage(
+            channel=opened["channel"]["id"], text=call(__file__, "loginEndedNotice", self.actor),
+        ), 15)
+        login.update({}, told=int(time.time()))
+        LOG.warning("hermes22muse: muse.ai login ended; told the user")
 
     async def send_to_muse(self, muse, job, entry):
         async def history(job_id):
@@ -442,7 +481,7 @@ class Relay:
                     self.store.collect(job_id, messages, full, busy)
                     wanted = self.store.approvals(job_id)
                     if wanted["wanted"] > wanted["checked"]:
-                        self.store.measured_approvals(job_id, await muse.pending_approvals(job_id))
+                        self.store.measured_approvals(job_id, await self.pending_approvals(muse, job_id))
         except Exception as exc:
             retry = max(retry or 0, self.retry(job, exc))
         self.store.schedule(job, retry=retry)
@@ -455,8 +494,15 @@ class Relay:
                 LOG.warning("hermes22muse: another gateway owns the relay")
                 return
             running = set()
+            login_checked = 0
             async with asyncio.TaskGroup() as tasks:
                 while True:
+                    if self.web is not None and time.monotonic() - login_checked > LOGIN_CHECK:
+                        login_checked = time.monotonic()
+                        try:
+                            await self.keep_login()
+                        except Exception as exc:
+                            LOG.warning("hermes22muse: muse.ai login check failed (%s)", exc or type(exc).__name__)
                     if self.slack.adapter._running and len(running) < MAX_WORKERS:
                         for job in self.store.due(self.actor, running):
                             job_id = job["id"]

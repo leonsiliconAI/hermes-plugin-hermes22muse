@@ -17,6 +17,7 @@ sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 from hermes22muse.muse import Message, MuseChat, MuseError, STAMP, history_messages
+from hermes22muse import museweb
 from hermes22muse import relay as relay_module
 from hermes22muse.relay import Relay, Slack, Store, operation_id
 
@@ -374,7 +375,9 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tools_are_always_listed(self):
         # Hermes evaluates a check_fn before the Slack adapter wires the relay and keeps the result.
-        self.assertEqual(sorted(self.tools), ["muse_handoff", "muse_reply", "muse_wait"])
+        self.assertEqual(sorted(self.tools), [
+            "muse_app", "muse_app_methods", "muse_approvals", "muse_approve", "muse_file",
+            "muse_handoff", "muse_reply", "muse_wait"])
         self.assertTrue(all("check_fn" not in options for options in self.tool_options.values()))
 
     async def test_waiting_tools_report_a_pending_approval(self):
@@ -469,3 +472,323 @@ class HistoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeGateway:
+    """muse.ai and the personal computer's gateway, speaking the app's own wire format."""
+
+    def __init__(self):
+        self.requests, self.site, self.sockets = [], [], 0
+        self.login, self.next_login = "first", None
+        self.answers = {}
+        self.reject_token = False
+
+    def http(self, verb, url, headers, body=None):
+        path = url.removeprefix("https://muse.ai")
+        self.site.append((verb, path, headers.get("Cookie"), json.loads(body) if body else None))
+        if f"hatch_sess={self.login}" not in headers["Cookie"]:
+            return 401, "{}", {}
+        issued = {}
+        if path == "/api/session":
+            if self.next_login:
+                self.login, self.next_login = self.next_login, None
+                issued = {"hatch_sess": (self.login, 1900000000)}
+            return 200, json.dumps({"status": "assigned", "vm_id": "vm-1", "vm_state": "RUNNING"}), issued
+        if path == "/api/auth/check":
+            return 200, '{"access_token": "access"}', {}
+        if path == "/api/hatch/token":
+            return 200, '{"token": "tok en"}', {}
+        return 404, "{}", {}
+
+    def socket(self, url):
+        self.sockets += 1
+        if self.reject_token:
+            self.reject_token = False
+            raise ConnectionError("refused")
+        assert url == "wss://hatch.metaaivm.com/v1/noise?vm_id=vm-1&auth_token=tok%20en"
+        return FakeSocket(self)
+
+
+class FakeSocket:
+    """The responder side of Noise_XX_25519_AESGCM_SHA256 and the gateway behind it."""
+
+    def __init__(self, gateway):
+        self.gateway, self.outbox, self.noise, self.closed = gateway, [], museweb.Noise(), False
+
+    def send(self, data):
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+
+        noise = self.noise
+        if not hasattr(noise, "remote"):
+            noise.remote = X25519PublicKey.from_public_bytes(data[:32])
+            noise._mix_hash(data[:32])
+            noise._handshake_seal(data[32:], opening=True)
+            reply = noise._public(noise.ephemeral)
+            noise._mix_hash(reply)
+            noise._mix_key(noise.ephemeral.exchange(noise.remote))
+            reply += noise._handshake_seal(noise._public(noise.static))
+            noise._mix_key(noise.static.exchange(noise.remote))
+            self.outbox.append(reply + noise._handshake_seal(b""))
+        elif noise.sending is None:
+            client = X25519PublicKey.from_public_bytes(noise._handshake_seal(data[:48], opening=True))
+            noise._mix_key(noise.ephemeral.exchange(client))
+            noise._handshake_seal(data[48:], opening=True)
+            noise.receiving, noise.sending = ([key, 0] for key in noise._hkdf(b""))
+        else:
+            self.serve(noise.decrypt(data))
+
+    def serve(self, frame):
+        fields = lambda data: dict(museweb._fields(data))
+        envelope = fields(fields(frame)[4])
+        service_frame = fields(envelope[2])
+        request = fields(service_frame[2])
+        verb, path = bytes(request[1]).decode(), bytes(request[2]).decode()
+        body = json.loads(bytes(request[4])) if 4 in request else None
+        self.gateway.requests.append((envelope.get(1, 0), verb, path, body))
+        status, kind, data = self.gateway.answers.get((verb, path), (404, "application/json", b'{"error":"no"}'))
+        header = museweb._field(1, b"content-type") + museweb._field(2, kind.encode())
+        response = museweb._field(1, status) + museweb._field(2, header)
+        # The head, then the body in two chunks.
+        half = len(data) // 2
+        for part in (museweb._field(3, response),
+                     museweb._field(4, museweb._field(1, data[:half])),
+                     museweb._field(4, museweb._field(1, data[half:]) + museweb._field(2, 1))):
+            payload = museweb._field(1, museweb._field(1, service_frame[1]) + part)
+            # Long answers span several Noise messages that share a chunk ID.
+            pieces = [payload[index:index + 30000] for index in range(0, len(payload), 30000)] or [b""]
+            for index, piece in enumerate(pieces):
+                self.outbox.append(self.noise.encrypt(
+                    museweb._field(1, 7) + museweb._field(2, index) + museweb._field(3, len(pieces))
+                    + museweb._field(4, piece)))
+
+    def receive(self, timeout):
+        if not self.outbox:
+            raise TimeoutError
+        return self.outbox.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+PENDING = {"pending_approvals": [
+    {"approval_id": "ap-1", "status": "pending", "requested_at_ms": 1795000000000,
+     "session_id": JOB,
+     "decision_options": [{"kind": "allow_once", "label_text": "Allow"},
+                          {"kind": "allow_always", "label_text": "Always allow apple.com",
+                           "label": {"kind": "allow_always_scoped", "scope": "destination_domain"}},
+                          {"kind": "deny", "label_text": "Deny"}],
+     "display": {"display_name": "Browser", "card_title": "Allow {assistant} to log in to apple.com using Browser?",
+                 "permission_question": {"kind": "sign_in", "text": "Allow {assistant} to log in?"},
+                 "purpose_summary": "The agent wants to sign in to apple.com using your saved login details.",
+                 "request_preview_document": {"blocks": [{"type": "fields", "rows": [
+                     {"label": "Website", "value": "apple.com"}]}]}}},
+    {"approval_id": "ap-2", "status": "pending", "approval_type": "purchase_preapproval",
+     "session_id": "another-chat",
+     "decision_options": [{"kind": "allow_once"}, {"kind": "deny"}],
+     "display": {"card_title": "Approve this purchase"}},
+    {"approval_id": "ap-3", "status": "allowed", "decision_options": [{"kind": "allow_once"}]},
+]}
+
+
+class MuseWebTests(unittest.TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.gateway = FakeGateway()
+        self.web = museweb.MuseWeb(Path(temporary.name), self.gateway)
+        self.web.login.update(museweb.parse_cookies("hatch_sess=first; theme=dark"))
+
+    def test_a_call_travels_the_apps_wire_format_and_extends_the_login(self):
+        self.gateway.answers[("GET", "/approvals")] = (200, "application/json", json.dumps(PENDING).encode())
+        self.gateway.answers[("POST", "/approvals/ap%2F1/decide")] = (
+            200, "application/json", json.dumps({"approval": {"status": "allowed", "text": "x" * 70000}}).encode())
+        self.gateway.next_login = "second"
+        first, second = self.web.calls([
+            ("egress.approvals", None),
+            ("egress.approval.decide", {"approval_id": "ap/1", "decision": "allow_once"})])
+        self.assertEqual(first["body"], PENDING)
+        self.assertEqual(len(second["body"]["approval"]["text"]), 70000)
+        # Sentinel is service 1; the body carries every parameter, as the app sends it.
+        self.assertEqual(self.gateway.requests, [
+            (1, "GET", "/approvals", None),
+            (1, "POST", "/approvals/ap%2F1/decide", {"approval_id": "ap/1", "decision": "allow_once"})])
+        # muse.ai replaced the login cookie while answering; the new one was saved and used at once.
+        saved = self.web.login.read()
+        self.assertEqual((saved["cookies"]["hatch_sess"], saved["expires"]["hatch_sess"], saved["computer"]),
+                         ("second", 1900000000, "vm-1"))
+        self.assertEqual([cookie for _, path, cookie, _ in self.gateway.site],
+                         ["hatch_sess=first; theme=dark"] + ["hatch_sess=second; theme=dark"] * 2)
+        self.assertEqual(oct(self.web.login.path.stat().st_mode & 0o777), "0o600")
+        # Tokens and the computer are reused for the next call.
+        self.web.call("egress.approvals")
+        self.assertEqual(len(self.gateway.site), 3)
+
+    def test_a_refused_connection_fetches_fresh_tokens_once(self):
+        self.gateway.answers[("GET", "/goals")] = (200, "application/json", b'{"goals": []}')
+        self.web.call("goals.list")
+        self.gateway.reject_token = True
+        self.assertEqual(self.web.call("goals.list")["body"], {"goals": []})
+        self.assertEqual([path for _, path, _, _ in self.gateway.site].count("/api/hatch/token"), 2)
+
+    def test_an_ended_login_is_reported_and_remembered(self):
+        self.gateway.login = "revoked elsewhere"
+        with self.assertRaises(museweb.MuseLoginRequired):
+            self.web.call("goals.list")
+        self.assertTrue(self.web.signed_in(), "one refusal may be muse.ai's mistake")
+        with self.assertRaises(museweb.MuseLoginRequired):
+            self.web.call("goals.list")
+        self.assertFalse(self.web.signed_in())
+        self.assertEqual(self.web.login.read()["cookies"]["hatch_sess"], "first")
+        requests = len(self.gateway.site)
+        with self.assertRaises(museweb.MuseLoginRequired):
+            self.web.call("goals.list")
+        self.assertEqual(len(self.gateway.site), requests, "an ended login is not sent again")
+
+    def test_errors_streams_and_requests_follow_the_app(self):
+        with self.assertRaises(museweb.MuseApiError) as refused:
+            self.web.call("tasks.list")
+        self.assertEqual(refused.exception.status, 404)
+        self.gateway.answers[("POST", "/chat/subscribe")] = (
+            200, "application/x-ndjson", b'{"a":1}\n{"b":2}\n')
+        self.assertEqual(self.web.call("chat.subscribe", listen=1)["body"], [{"a": 1}, {"b": 2}])
+        self.assertEqual(museweb.build_request("chat.history", {"session_id": "s", "limit": 5}),
+                         (0, "GET", "/chat/history?session_id=s&limit=5", b""))
+        self.assertEqual(museweb.build_request("fs.raw", {"path": "workspace/a b.txt"})[2],
+                         "/fs/raw/workspace/a%20b.txt")
+        self.assertEqual(museweb.build_request("tasks.delete", {"job_id": "j"}), (0, "DELETE", "/api/tasks/j", b""))
+        with self.assertRaises(museweb.MuseWebError):
+            museweb.build_request("tasks.run", {})
+        with self.assertRaises(museweb.MuseWebError):
+            museweb.build_request("no.such.method", {})
+
+    def test_cookies_are_read_from_a_browser_export(self):
+        exported = json.dumps([
+            {"name": "hatch_sess", "value": "abc", "domain": ".muse.ai", "expires": 1900000000.5},
+            {"name": "other", "value": "x", "domain": "gadgets.muse.ai", "expires": -1}])
+        self.assertEqual(museweb.parse_cookies(exported), {"hatch_sess": ("abc", 1900000000.5)})
+        self.assertEqual(museweb.parse_cookies("Cookie: a=1; hatch_sess=b=c"), {"a": ("1", None), "hatch_sess": ("b=c", None)})
+
+    def test_the_method_table_is_read_from_the_apps_page(self):
+        page = ("x=[{method:`tasks.run`,httpMethod:`POST`,path:`/tasks/{job_id}/run`},"
+                "{method:`dyi.export`,httpMethod:`POST`,path:`/api/dyi/export`,service:`daemon`,"
+                "requestBody:`empty`,requestTimeoutMs:39e5,maxResponseBytes:1/0}]")
+        self.assertEqual(museweb.app_routes(page), [
+            {"method": "dyi.export", "http": "POST", "path": "/api/dyi/export", "service": "daemon",
+             "requestBody": "empty", "requestTimeoutMs": 3900000},
+            {"method": "tasks.run", "http": "POST", "path": "/tasks/{job_id}/run"}])
+
+
+class MuseAppPolicyTests(unittest.TestCase):
+    def policy(self, name, *args):
+        return plugin.call(plugin.__file__, name, *args)
+
+    def test_approvals_are_listed_for_their_side_chat_in_plain_terms(self):
+        listed = self.policy("approvalList", PENDING, JOB)
+        self.assertEqual(listed["pending_in_all_chats"], 2)
+        [approval] = listed["approvals"]
+        self.assertEqual(approval["asks"], "Allow Muse to log in to apple.com using Browser?")
+        self.assertEqual(approval["details"], ["Website: apple.com"])
+        self.assertEqual([option["decision"] for option in approval["options"]],
+                         ["allow_once", "allow_always", "deny"])
+        self.assertNotIn("leon_decides", approval)
+        everything = self.policy("approvalList", PENDING, None)["approvals"]
+        self.assertEqual(everything[1]["leon_decides"], "it spends or moves money")
+
+    def test_hermes_allows_what_was_asked_and_leaves_money_and_standing_choices_to_leon(self):
+        allow = self.policy("approvalDecide", PENDING, "ap-1", "allow_once", False)
+        self.assertEqual(allow["params"], {"approval_id": "ap-1", "decision": "allow_once"})
+        self.assertIn("Leon decides", self.policy("approvalDecide", PENDING, "ap-1", "allow_always", False)["error"])
+        always = self.policy("approvalDecide", PENDING, "ap-1", "allow_always", True)["params"]
+        self.assertEqual((always["always_scope"], always["allow_always_scope"]),
+                         ("destination_domain", "destination_domain"))
+        self.assertIn("money", self.policy("approvalDecide", PENDING, "ap-2", "allow_once", False)["error"])
+        self.assertIn("params", self.policy("approvalDecide", PENDING, "ap-2", "allow_once", True))
+        self.assertIn("params", self.policy("approvalDecide", PENDING, "ap-2", "deny", False))
+        self.assertIn("does not offer", self.policy("approvalDecide", PENDING, "ap-2", "deny_always", True)["error"])
+        self.assertIn("No pending approval", self.policy("approvalDecide", PENDING, "ap-3", "allow_once", True)["error"])
+
+    def test_risky_app_methods_wait_for_leon(self):
+        for method in ("bootstrap.reset", "egress.permissions.hitl", "permissions.settings.update",
+                       "credentials.delete", "ssh.operator.enable", "email.mailbox.delete"):
+            self.assertIn("Ask Leon first", self.policy("methodGuard", method, False), method)
+            self.assertIsNone(self.policy("methodGuard", method, True), method)
+        for method in ("tasks.list", "egress.permissions", "permissions.settings", "session.rename",
+                       "credentials.list", "egress.approval.history"):
+            self.assertIsNone(self.policy("methodGuard", method, False), method)
+        self.assertIn("muse_approve", self.policy("methodGuard", "egress.approval.decide", True))
+
+    def test_methods_are_found_by_what_they_do(self):
+        found = self.policy("methodSearch", list(museweb.ROUTES.values()), "scheduled tasks")
+        self.assertEqual(found["methods"][0]["method"], "tasks.list")
+        self.assertIn("tasks.run", found["methods"][0]["note"])
+        self.assertGreater(found["total"], 400)
+        clipped = self.policy("clipAnswer", [{"text": "x" * 400}] * 10, 1000)
+        self.assertEqual((clipped["truncated"], clipped["shown"], clipped["of"]), (True, 2, 10))
+
+
+class MuseAppToolTests(ToolTests):
+    async def asyncSetUp(self):
+        self.gateway = FakeGateway()
+        self.gateway.answers[("GET", "/approvals")] = (200, "application/json", json.dumps(PENDING).encode())
+        self.gateway.answers[("POST", "/approvals/ap-1/decide")] = (
+            200, "application/json", b'{"approval": {"approval_id": "ap-1", "status": "allowed"}}')
+        self.gateway.answers[("GET", "/tasks")] = (200, "application/json", b'{"schedules": []}')
+        self.gateway.answers[("GET", "/media/raw/workspace/a.png")] = (200, "image/png", b"\x89PNG")
+
+        def signed_in(directory):
+            web = museweb.MuseWeb(directory, self.gateway)
+            web.login.update(museweb.parse_cookies("hatch_sess=first"))
+            return web
+
+        patcher = patch.object(plugin, "MuseWeb", signed_in)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        await super().asyncSetUp()
+        constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
+        patcher = patch.dict(sys.modules, {"hermes_constants": constants})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_waiting_tools_report_a_pending_approval(self):
+        self.assertEqual(self.call("muse_handoff", task="Check the App Store review")["status"], "not_delivered")
+        now = relay_module.time.time()
+        with self.store.connection() as db:
+            db.execute("UPDATE handoffs SET approvals=1, approvals_at=?, approvals_wanted=?", (now, now - 1))
+        result = self.call("muse_wait")
+        self.assertEqual(result["status"], "waiting_for_approval")
+        self.assertEqual([approval["approval"] for approval in result["approvals"]], ["ap-1"])
+        self.assertIn("muse_approve", result["next"])
+        self.assertNotIn("Beeper", result["next"])
+
+    async def test_hermes_answers_an_approval_and_works_the_app_as_leon(self):
+        self.assertEqual(len(self.call("muse_approvals")["approvals"]), 2)
+        self.assertIn("Leon decides", self.call("muse_approve", approval="ap-2", decision="allow_once")["error"])
+        result = self.call("muse_approve", approval="ap-1", decision="allow_once")
+        self.assertEqual((result["decided"], result["status"]), ("allow_once", "allowed"))
+        self.assertEqual(self.gateway.requests[-1],
+                         (1, "POST", "/approvals/ap-1/decide", {"approval_id": "ap-1", "decision": "allow_once"}))
+        self.assertEqual(self.call("muse_app", method="tasks.list"), {"schedules": []})
+        self.assertIn("Ask Leon first", self.call("muse_app", method="bootstrap.reset")["error"])
+        self.assertIn("no method", self.call("muse_app", method="tasks.explode")["error"])
+        self.assertEqual(self.call("muse_app", method="goals.list")["error"], "Muse refused it (404).")
+        self.assertEqual(self.call("muse_app_methods", query="approval history")["methods"][0]["method"],
+                         "egress.approval.history")
+        saved = self.call("muse_file", path="sandbox://workspace/a.png")
+        self.assertEqual((Path(saved["saved"]).read_bytes(), saved["type"]), (b"\x89PNG", "image/png"))
+
+    async def test_only_leons_own_requests_reach_the_app(self):
+        requests = len(self.gateway.requests)
+        for change in ({"user_id": "UOTHER"}, {"platform": "telegram"}):
+            self.session.update(change)
+            for name, args in (("muse_approvals", {}), ("muse_app", {"method": "tasks.list"}),
+                               ("muse_approve", {"approval": "ap-1", "decision": "allow_once"}),
+                               ("muse_file", {"path": "workspace/a.png"})):
+                self.assertIn("only work on Leon's own requests", self.call(name, **args)["error"])
+        self.assertEqual(len(self.gateway.requests), requests)
+        # A job with no chat platform, such as a scheduled one, is Leon's own.
+        self.session.update(platform="", user_id="")
+        self.assertEqual(self.call("muse_app", method="tasks.list"), {"schedules": []})
+
+    async def test_a_missing_login_says_how_to_sign_in(self):
+        self.gateway.login = "ended"
+        self.assertIn("Leon has to sign in again", self.call("muse_approvals")["error"])
