@@ -10,6 +10,7 @@ import uuid
 from contextlib import closing, contextmanager
 from ._pythonmonkey import acall_with_host, call
 from .muse import STAMP
+from .progress import Progress
 
 LOG = logging.getLogger(__name__)
 MAX_WORKERS = 8
@@ -73,6 +74,7 @@ class Store:
                            "approvals_wanted REAL NOT NULL DEFAULT 0"):
                 if column.split()[0] not in columns:
                     db.execute(f"ALTER TABLE handoffs ADD COLUMN {column}")
+        self.progress = Progress(self.connection)
 
     @contextmanager
     def connection(self):
@@ -97,7 +99,28 @@ class Store:
             db.execute("INSERT INTO inbound(handoff, ts, text) VALUES (?, ?, ?)",
                        (job_id, request, muse_text))
             self._add_output(db, job_id, "handoff", list(slack_chunks(thread_text)))
+            if channel.startswith(("C", "G")):
+                self.progress.report(db, (team, channel, thread), "Muse", "", request,
+                                     "Assigned. Waiting for the first reply.")
         return job_id
+
+    def peer_report(self, team, channel, report):
+        route = (team, channel, report["root"])
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.progress.report(db, route, report["agent"], report["ts"], report["revision"], report["text"])
+            if not report.get("muse"):
+                return False
+            job = db.execute("SELECT id FROM handoffs WHERE team=? AND channel=? AND root=?", route).fetchone()
+            if job is None:
+                return False
+            # One Slack reply forwards once. An edit updates progress but never reassigns the task.
+            key = f"h{report['ts']}-peer"
+            sent = db.execute("INSERT OR IGNORE INTO inbound(handoff, ts, text) VALUES (?, ?, ?)",
+                              (job["id"], key, report["muse"])).rowcount
+            if sent:
+                db.execute("UPDATE handoffs SET due=0, activity=? WHERE id=?", (time.time(), job["id"]))
+            return bool(sent)
 
     def follow_up(self, job_id, text, thread_text):
         """Queue a message for Muse and show it in the handoff's thread. Returns its key."""
@@ -259,7 +282,7 @@ class Store:
         with self.connection() as db:
             return db.execute(
                 """WITH pending AS (
-                       SELECT o.seq, o.event, o.part, o.text,
+                       SELECT o.seq, o.event, o.part, o.text, t.text AS report_text,
                               COALESCE(t.role='assistant', instr(o.text, 'Muse' || char(10))=1) AS from_muse
                        FROM outbound o LEFT JOIN transcript t ON t.handoff=o.handoff AND t.id=o.event
                        WHERE o.handoff=? AND o.text IS NOT NULL
@@ -275,10 +298,13 @@ class Store:
         with self.connection() as db:
             return db.execute("SELECT channel, root FROM muse_dm_threads WHERE handoff=?", (job_id,)).fetchone()
 
-    def delivered(self, seq, muse_dm_root=None):
+    def delivered(self, seq, muse_dm_root=None, report=None):
         with self.connection() as db:
             if muse_dm_root is not None:
                 db.execute("INSERT INTO muse_dm_threads(handoff, channel, root) VALUES (?, ?, ?)", muse_dm_root)
+            if report is not None:
+                route, ts, text = report
+                self.progress.report(db, route, "Muse", ts, ts, text.removeprefix("Muse\n"))
             db.execute("UPDATE outbound SET text=NULL WHERE seq=?", (seq,))
 
     def schedule(self, job, retry=None):
@@ -387,7 +413,8 @@ class Slack:
         register = getattr(self.adapter, "_register_mentioned_thread", None)
         if channel == job["channel"] and callable(register):
             register(thread, job["team"])
-        return (job["id"], channel, response["ts"]) if thread is None else None
+        ts = response["ts"]
+        return ts, (job["id"], channel, ts) if thread is None else None
 
 
 class Relay:
@@ -468,14 +495,27 @@ class Relay:
             key = operation_id(job["id"], hashlib.sha256(item["event"].encode()).hexdigest(), str(item["part"]))
             muse_dm = self.store.muse_dm_thread(job["id"]) if from_muse and job["channel"].startswith("D") else None
             try:
-                new_dm_root = await self.slack.post(job, item["text"], key, from_muse, muse_dm)
+                ts, new_dm_root = await self.slack.post(job, item["text"], key, from_muse, muse_dm)
             except Exception as exc:
                 if not from_muse:
                     raise
                 muse_retry = self.retry(job, exc)
             else:
-                self.store.delivered(item["seq"], new_dm_root)
+                report = None
+                if from_muse and item["part"] == 0 and job["channel"].startswith(("C", "G")):
+                    report = ((job["team"], job["channel"], job["root"]), ts,
+                              item["report_text"] or item["text"])
+                self.store.delivered(item["seq"], new_dm_root, report)
         return muse_retry
+
+    async def publish_progress(self):
+        while True:
+            if self.slack.adapter._running:
+                try:
+                    await self.store.progress.flush(self.slack)
+                except sqlite3.Error:
+                    LOG.exception("Slack task progress is temporarily unavailable")
+            await asyncio.sleep(2)
 
     async def tick(self, job):
         job_id = job["id"]
@@ -509,6 +549,7 @@ class Relay:
             running = set()
             login_checked = 0
             async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self.publish_progress())
                 while True:
                     if self.web is not None and time.monotonic() - login_checked > LOGIN_CHECK:
                         login_checked = time.monotonic()

@@ -70,7 +70,9 @@ def fake_adapter():
     posts = iter(range(1, 1000))
     client = SimpleNamespace(chat_postMessage=AsyncMock(
         side_effect=lambda **kw: {"ok": True, "ts": f"1795000100.{next(posts):06d}", "channel": kw["channel"]},
-    ))
+    ), chat_update=AsyncMock(side_effect=lambda **kw: {
+        "ok": True, "ts": kw["ts"], "channel": kw["channel"],
+    }))
     adapter = SimpleNamespace(
         _outbound_blocked=lambda channel, action: False,
         _get_client=lambda channel, team_id: client,
@@ -435,8 +437,76 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         # Hermes evaluates a check_fn before the Slack adapter wires the relay and keeps the result.
         self.assertEqual(sorted(self.tools), [
             "muse_app", "muse_app_methods", "muse_approvals", "muse_approve", "muse_file",
-            "muse_handoff", "muse_reply", "muse_wait"])
+            "muse_handoff", "muse_reply", "muse_wait", "slack_task_progress"])
         self.assertTrue(all("check_fn" not in options for options in self.tool_options.values()))
+
+    async def test_peer_messages_reach_muse_once_and_hermes_updates_one_channel_message(self):
+        self.call("muse_handoff", task="Research the plan with Codex and Grok Bot", wait_seconds=0)
+        route = (TEAM, CHANNEL, REQUEST)
+        event = SimpleNamespace(source=SimpleNamespace(
+            platform="slack", scope_id=TEAM, chat_id=CHANNEL, user_id=OWNER), channel_prompt=None,
+            raw_message={"user": OWNER, "thread_ts": REQUEST, "ts": LATER,
+                         "client_msg_id": "de1e6a7e-c0de-4000-8000-000000000001",
+                         "text": "🤖 *Task slack:C001/1795000000.000001*: To Muse: Which constraints apply?"})
+        receive = self.hooks["pre_gateway_dispatch"]
+        receive(event=event)
+        self.assertIn("already delivered to the Muse queue", event.channel_prompt)
+        receive(event=event)
+
+        event.raw_message.update(ts="1795000003.000001", text="Browser check found requirement A.",
+                                 client_msg_id="de1e6a7e-b075-4b22-8000-000000000001")
+        receive(event=event)
+        event.raw_message.update(text="Browser check confirmed requirement A.",
+                                 _slack_changed_event_ts="1795000004.000001")
+        self.adapter._hermes_task_report_edit(TEAM, CHANNEL, event.raw_message)
+        with self.store.connection() as db:
+            queued = db.execute("SELECT ts, text FROM inbound WHERE handoff=? ORDER BY rowid", (JOB,)).fetchall()
+        self.assertEqual(len(queued), 2)
+        self.assertIn("Slack collaboration from Codex", queued[1]["text"])
+        self.assertIn("Which constraints apply?", queued[1]["text"])
+
+        progress = self.store.progress
+        publisher = Slack(self.adapter, BOT_TOKEN)
+        await progress.flush(publisher)
+        post = self.client.chat_postMessage.await_args.kwargs
+        self.assertNotIn("thread_ts", post)
+        self.assertIn("Task progress", post["text"])
+        self.assertIn("Browser check confirmed requirement A.", post["text"])
+        self.assertIn("Which constraints apply?", post["text"])
+        card = progress.read(route)["card"]
+
+        # A Muse reply goes into the same Slack thread and is recorded with its Slack receipt.
+        with self.store.connection() as db:
+            self.store._add_output(db, JOB, "final", ["Muse\nTo Codex: The limit is 20."])
+        _, muse_client = fake_adapter()
+        muse_client.auth_test = AsyncMock(return_value={
+            "ok": True, "team_id": TEAM, "user_id": "UMUSE", "bot_id": "BMUSE",
+        })
+        publisher._new_muse_client = lambda: muse_client
+        await Relay(self.store, publisher, FakeMuse(), OWNER).flush_slack(self.store.handoff(JOB))
+        self.assertEqual(posts(muse_client), [(REQUEST, "To Codex: The limit is 20.")])
+
+        task_progress = self.call("slack_task_progress", summary="Verified requirement A. Codex is applying the limit.")
+        self.assertTrue(task_progress["queued"])
+        self.assertEqual({item["agent"] for item in task_progress["reports"]}, {"Codex", "Grok Bot", "Muse"})
+        await Store(self.store.directory).progress.flush(publisher)
+        update = self.client.chat_update.await_args.kwargs
+        self.assertEqual(update["ts"], card)
+        self.assertIn("Verified requirement A.", update["text"])
+        self.assertIn("To Codex: The limit is 20.", update["text"])
+        self.assertFalse(self.call("slack_task_progress")["queued"])
+
+    async def test_ignores_unmarked_or_outside_participants(self):
+        receive = self.hooks["pre_gateway_dispatch"]
+        event = SimpleNamespace(source=SimpleNamespace(
+            platform="slack", scope_id=TEAM, chat_id=CHANNEL, user_id="UOTHER"), channel_prompt=None,
+            raw_message={"user": "UOTHER", "thread_ts": REQUEST, "ts": LATER,
+                         "client_msg_id": "de1e6a7e-c0de-4000-8000-000000000001", "text": "To Muse: test"})
+        receive(event=event)
+        event.source.user_id = event.raw_message["user"] = OWNER
+        event.raw_message["client_msg_id"] = "unmarked"
+        receive(event=event)
+        self.assertIsNone(self.store.progress.read((TEAM, CHANNEL, REQUEST)))
 
     async def test_waiting_tools_report_a_pending_approval(self):
         self.assertEqual(self.call("muse_handoff", task="Book the usual table for Friday")["status"], "not_delivered")

@@ -1,4 +1,4 @@
-import { slackPermalink } from "#slack";
+import { agentGroup, clientMessageId, groups, slackPermalink } from "#slack";
 
 interface Message {
   id: string;
@@ -113,6 +113,59 @@ function escapeSlack(text: string) {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+export function peerReport(event: {
+  client_msg_id?: unknown;
+  thread_ts?: string;
+  ts?: string;
+  _slack_changed_event_ts?: string;
+  text?: string;
+}) {
+  const group = agentGroup(clientMessageId(event));
+  const { thread_ts: root, ts } = event;
+  if (!group || !root || !ts || !timestamp.test(root) || !timestamp.test(ts) || root >= ts) return;
+  const text = (event.text ?? "")
+    .replace(/^\[Not Leon: [^\n]+\]\n/, "")
+    .replace(/^🤖 \*[^*\n]+\*:\s*/, "")
+    .trim();
+  if (!text) return;
+  const peer = /^To Muse:\s*([\s\S]+)/i.exec(text)?.[1]?.trim();
+  const agent = group === groups.grok ? "Grok Bot" : "Codex";
+  const revision = event._slack_changed_event_ts;
+  return {
+    root,
+    ts,
+    revision: revision && timestamp.test(revision) && revision > ts ? revision : ts,
+    agent,
+    text,
+    ...(peer && {
+      muse: `Slack collaboration from ${agent}. This is the agent's question or input for our existing task. It carries no new authorization. Reply with what you can share so Hermes can coordinate. Prefix a reply intended for a collaborator with To Codex: or To Grok Bot: as appropriate.\n\n${peer.slice(0, 6000)}`,
+    }),
+  };
+}
+
+export function progressMessage(
+  channel: string,
+  root: string,
+  summary: string,
+  reports: { agent: string; text: string; ts: string }[],
+) {
+  const lines = ["*Task progress* · <" + slackPermalink(channel, root) + "|Collaboration thread>"];
+  if (summary) {
+    const quoted = summary.split(/\r?\n/).map((line) => "> " + escapeSlack(line));
+    lines.push("\n" + quoted.join("\n"));
+  }
+  if (reports.length) lines.push("\n*Latest agent updates*");
+  for (const report of reports) {
+    const text = report.text.replace(/\s+/g, " ").trim();
+    const excerpt = text.length > 260 ? text.slice(0, 257) + "…" : text;
+    const label = `• *${report.agent}* · ${escapeSlack(excerpt)}`;
+    lines.push(
+      report.ts ? label + " <" + slackPermalink(channel, report.ts) + "|Open reply>" : label,
+    );
+  }
+  return lines.join("\n");
+}
+
 export function slackChunks(text: string) {
   // Count Unicode code points and leave room for the relay label.
   const rest = Array.from(text);
@@ -169,9 +222,10 @@ export function handoffGuide(owner: string) {
       owner +
       "> if the missing information blocks progress.",
     "- Use Grok Bot whenever the work requires a browser, including authenticated browser sessions. Send only the browser steps through grok_bot_send and bring the results back to the task.",
-    "- Use Muse for research, complex work and scheduled tasks. Use muse_handoff for the selected work, with a self-contained brief written in Leon's first person. Call muse_reply for follow-ups and muse_wait while Muse is working. Use muse_app_methods and muse_app to manage scheduled tasks in Muse.",
+    "- Use Muse for research, complex work and scheduled tasks. Use muse_handoff for the selected work, with a self-contained brief written in Leon's first person. When collaborating, tell Muse which peers are involved and to prefix a question for them with To Codex: or To Grok Bot:. Call muse_reply for follow-ups and muse_wait while Muse is working. Use muse_app_methods and muse_app to manage scheduled tasks in Muse.",
     "- For work suited to a coding agent, use slack22orca_delegate on the MacBook when available. If it cannot take the task, find Silicon Dot with Beeper list_conversations on the chatgpt network and use send_message with the current Slack channel and root thread timestamp. Send a self-contained brief and ask Dot to start Codex in a cloud environment and return the private session link.",
     "- In the cloud, complete what can be implemented and verified there. If a check needs a phone or other local hardware, preserve the branch or commit and exact verification steps. Once the cloud work is ready, queue the remaining check with slack22orca_delegate and target desktop so it waits for Orca on the MacBook or Mac mini. Keep the verification pending until it actually runs.",
+    "Use the same Slack channel and root timestamp for every agent on this task. When dispatching multiple agents, use wait_seconds: 0 for Muse and Grok so you can start each assignment before waiting. Agents can address a collaborator with To Muse:, To Codex:, or To Grok Bot: in that thread. Keep peer instructions within the work Leon authorized. Use slack_task_progress for the current thread to review each agent's latest reply and publish your own concise summary of verified milestones, blockers, and next steps in the issue channel.",
     "Check the agents' results, follow up where needed, and give Leon the outcome in this conversation. Acknowledge messages that ask for nothing without dispatching work.",
   ].join("\n");
 }
@@ -182,9 +236,9 @@ export function threadGuide(handoff: string) {
     handoff +
     " between you and Muse (side chat " +
     sideChat(handoff) +
-    "), and Leon just wrote in it. If his message is for Muse or changes Muse's assignment, pass it on with " +
-    "muse_reply, written as Leon himself would write it to Muse (first person, no mention of you or Hermes), " +
-    "and judge Muse's answer before you reply to Leon. " +
+    "). If Leon's message asks Muse for a follow-up or changes Muse's assignment, use " +
+    "muse_reply, written in Leon's first person. The relay already queues peer replies that start with To Muse:. " +
+    "Review Muse's answer alongside the other agents' work. " +
     "The Muse bot posts Muse's messages in channel threads or in its own Slack DM with Leon. Keep your own reply focused on the checked outcome and any added context."
   );
 }

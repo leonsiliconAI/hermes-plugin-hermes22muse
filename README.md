@@ -16,6 +16,16 @@ The plugin adds routing guidance to the configured user’s Slack turns. Update 
 
 In Slack, use [slack22orca](../hermes-plugin-slack22orca/README.md) 1.1.0 or later for the MacBook handoff and to queue deferred checks with `target: desktop`. Use the [Beeper inbox](../../packages/ai/leonsilicon/services/beeper-inbox/README.md#agent-tasks-2026-11-21) to send a cloud handoff to Silicon Dot, and [slack22grokbot](../../packages/ai/leonsilicon/services/slack22grokbot/README.md) for browser steps.
 
+## Shared task thread and progress
+
+Use the issue channel ID and the same thread root for each handoff. `slack22muse` posts as Muse in that thread. [slack22chatgpt](../../packages/ai/leonsilicon/services/slack22chatgpt/README.md) gives Codex the same thread through Slack Puppet, and [slack22grokbot](../../packages/ai/leonsilicon/services/slack22grokbot/README.md) relays the thread to Grok Bot. Use the channel AutoLinear creates when the request starts in a DM.
+
+- Start a reply with `To Muse:` to route a Grok Bot or Codex message to the existing Muse side chat. Hermes labels it as peer input. Retries and edits update the Slack record without forwarding the same reply again.
+- Muse’s replies can start with `To Codex:` or `To Grok Bot:`. Codex reads the shared thread through Slack Puppet. Grok Bot receives peer replies through its conversation bridge. Hermes handles Leon’s follow-ups to Muse with `muse_reply`.
+- Hermes posts one **Task progress** message per collaboration thread at the top level of the issue channel. It edits that message as new reports arrive, with links to the latest reply from each agent. The message and pending updates survive a gateway restart. `slack_task_progress` reads it from the current channel and accepts a `summary` with Hermes’s checked milestones, blockers, and next steps. Autolinear commands still control the Linear issue status.
+
+Update [slack-as-leon-guard](../hermes-plugin-slack-as-leon-guard/README.md) to 1.3.0 or later so reports and Hermes’s replies stay in the collaboration thread. Install the current Beeper inbox release and configure Slack Puppet for the Codex environments that will join.
+
 ## The Muse app
 
 Hermes can also do what the user does in the Muse app, without a browser or screen control. The plugin speaks the app's own protocol: it trades a saved muse.ai login for a short-lived token, then calls the user's personal Muse computer over the app's encrypted WebSocket ([`museweb.py`](museweb.py)). It runs inside the Hermes gateway and needs no other machine.
