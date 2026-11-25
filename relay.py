@@ -63,8 +63,12 @@ class Store:
                 );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(handoffs)")}
+            # approvals: Muse's pending approval count for the side chat, measured at approvals_at
+            # when Hermes asked at approvals_wanted (NULL until measured).
             for column in ("busy INTEGER NOT NULL DEFAULT 0", "polled REAL NOT NULL DEFAULT 0",
-                           "changed REAL NOT NULL DEFAULT 0"):
+                           "changed REAL NOT NULL DEFAULT 0", "approvals INTEGER",
+                           "approvals_at REAL NOT NULL DEFAULT 0",
+                           "approvals_wanted REAL NOT NULL DEFAULT 0"):
                 if column.split()[0] not in columns:
                     db.execute(f"ALTER TABLE handoffs ADD COLUMN {column}")
 
@@ -119,6 +123,27 @@ class Store:
         with self.connection() as db:
             db.execute("UPDATE handoffs SET activity=?, due=MIN(due, ?) WHERE id=?",
                        (time.time(), time.time() + 1, job_id))
+
+    def want_approvals(self, job_id):
+        """Ask the relay to measure Muse's pending approvals for this handoff on its next pass."""
+        now = time.time()
+        with self.connection() as db:
+            db.execute("UPDATE handoffs SET approvals_wanted=?, activity=?, due=MIN(due, ?) WHERE id=?",
+                       (now, now, now, job_id))
+
+    def approvals(self, job_id):
+        with self.connection() as db:
+            row = db.execute("SELECT approvals, approvals_at, approvals_wanted, changed FROM handoffs WHERE id=?",
+                             (job_id,)).fetchone()
+        if row is None:
+            return {"count": None, "checked": 0, "wanted": 0, "changed": 0}
+        return {"count": row["approvals"], "checked": row["approvals_at"],
+                "wanted": row["approvals_wanted"], "changed": row["changed"]}
+
+    def measured_approvals(self, job_id, count):
+        with self.connection() as db:
+            db.execute("UPDATE handoffs SET approvals=?, approvals_at=? WHERE id=?",
+                       (count, time.time(), job_id))
 
     def answer(self, job_id):
         """Muse's messages after Hermes's latest delivery once Muse has finished, else the state."""
@@ -411,6 +436,9 @@ class Relay:
                         await self.send_to_muse(muse, job, entry)
                     messages, full, busy = await muse.history(job_id)
                     self.store.collect(job_id, messages, full, busy)
+                    wanted = self.store.approvals(job_id)
+                    if wanted["wanted"] > wanted["checked"]:
+                        self.store.measured_approvals(job_id, await muse.pending_approvals(job_id))
         except Exception as exc:
             retry = max(retry or 0, self.retry(job, exc))
         self.store.schedule(job, retry=retry)

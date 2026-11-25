@@ -25,8 +25,9 @@ HANDOFF_SCHEMA = {
         "Hand Leon's current Slack request to Muse, his personal AI, in a new Muse side chat, and "
         "wait for Muse's answer. Posts a reply in a thread under Leon's message showing exactly what "
         "was sent; Muse's replies and your follow-ups appear in that thread. Muse sees nothing but "
-        "`task`, so make it self-contained. Returns Muse's messages with status answered, or status "
-        "working if Muse is still busy after about five minutes (then call muse_wait)."
+        "`task`, so make it self-contained. Returns Muse's messages with status answered, status "
+        "waiting_for_approval if Muse needs Leon's approval (the result's `next` says how to answer "
+        "it), or status working if Muse is still busy after about five minutes (then call muse_wait)."
     ),
     "parameters": {
         "type": "object",
@@ -63,7 +64,8 @@ WAIT_SCHEMA = {
     "name": "muse_wait",
     "description": (
         "Keep waiting for Muse's answer in a handoff after muse_handoff or muse_reply returned "
-        "status working or not_delivered. Without `handoff`, uses the current message or thread."
+        "status working, not_delivered or waiting_for_approval (after answering the approval). "
+        "Without `handoff`, uses the current message or thread."
     ),
     "parameters": {
         "type": "object",
@@ -122,7 +124,8 @@ def register(ctx):
                 "lookup": blocking(lookup), "find": blocking(find),
                 "handoffId": operation_id, "create": blocking(store.create),
                 "followUp": blocking(store.follow_up), "answer": blocking(answer),
-                "touch": blocking(store.touch), "now": lambda: time.monotonic(),
+                "approvals": blocking(store.approvals), "wantApprovals": blocking(store.want_approvals),
+                "touch": blocking(store.touch), "now": lambda: time.monotonic(), "clock": lambda: time.time(),
                 "sleep": pause,
                 "logHandoff": lambda channel, message, job: LOG.info(
                     "hermes22muse: handed %s:%s to Muse as %s", channel, message, job),

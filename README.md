@@ -9,6 +9,12 @@ Hermes hands its configured user's Slack requests to Meta Muse side chats, check
 
 A short guide is added to each of the user's Slack turns so Hermes follows these steps; the user's messages in a handoff thread get the thread's own guide. The guide does not outrank the profile's own instructions. If `SOUL.md` tells Hermes to delegate requests to other agents, add a rule there that the user's Slack requests go to Muse through `muse_handoff`, then run `hermes sessions refresh-prompts`. Without it, Hermes on Hermes Cloud answered through `delegate_task` instead. Messages you type directly in the side chat appear in Slack with a "You in Muse" label. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
 
+## Approvals
+
+When Muse needs the user's approval in a side chat, Hermes answers it the way the user would, without UI automation. While a tool waits, the relay reads the side chat's pending approval count from muse-mcp's `muse_chat_status`: after about 20 seconds of work, every 30 seconds after that, and once more before an answer is returned. A pending approval makes the tool return `waiting_for_approval`. Hermes then finds Muse's request in Beeper (the Muse bridge's "Muse is waiting for your approval … `!muse approval-allow <code>`" message) and applies the user's approval rule: it sends `!muse approval-allow <code>` when the action is what the user asked for, and otherwise denies it or asks the user with a mention. Payments, purchases, money transfers and password, login or security changes always go to the user. If no request reaches Beeper within a minute, Hermes tells the user what Muse is waiting for.
+
+The Gadget link answers 403 for Muse's approvals API, and muse-mcp can only observe approvals, so Beeper's Muse bridge is the route. It needs Hermes's Beeper inbox and a rule in `SOUL.md` describing the approval commands.
+
 ## Set up Muse
 
 Pair the [official Muse Gadget SDK Linux client](https://github.com/facebookincubator/muse-gadget-sdk/tree/fbfe3b0f717f7f468d0a94aa370ea0ca1a94ebfe/linux) on a Linux host with Bluetooth LE. Get an [SDK token](https://gadgets.muse.ai/settings/sdk-tokens), approve pairing in the Muse phone app, then check `sudo musegadget doctor` on the host.

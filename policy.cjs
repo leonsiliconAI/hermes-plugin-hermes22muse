@@ -113,7 +113,7 @@ function handoffGuide(owner) {
 		"1. Work out what he is asking. Short messages such as \"continue\", \"do it\" or \"try again\" refer to earlier messages: read this conversation and, when needed, the channel's history, its Linear issue and the links there.",
 		"2. If you can write a clear, self-contained task, call muse_handoff with it. Muse receives it as a message from Leon himself, so write it the way he would type it to Muse: first person, short and direct, without mentioning yourself, Hermes, Slack, a relay or that you act for him. Muse sees only that text, so include the goal, every relevant detail (names, links, IDs, earlier decisions, constraints) and what a good answer looks like. Don't do the task yourself first.",
 		"3. If the request is too vague for that, don't call muse_handoff. Ask Leon one specific clarifying question and mention <@" + owner + "> so he is pinged.",
-		"4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply, also written as Leon; the exchange stays in that thread. If Muse is still working, call muse_wait.",
+		"4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply, also written as Leon; the exchange stays in that thread. If Muse is still working, call muse_wait. If it is waiting for Leon's approval, the result says how to answer it.",
 		"5. When you are satisfied, give Leon a concise, checked answer in your normal reply. The Muse bot relays the transcript in the original channel thread or, for a DM with you, in its own DM with Leon. Keep your own reply focused on the outcome, any corrections, and what Leon needs to know.",
 		"Messages that ask for nothing (thanks, ok) and Hermes commands don't go to Muse."
 	].join("\n");
@@ -124,7 +124,8 @@ function threadGuide(handoff) {
 const nextSteps = {
 	answered: "Check Muse's answer against Leon's request. If it is complete, give Leon the checked outcome in your usual reply. Otherwise follow up with muse_reply, written as Leon.",
 	working: "Muse is still working. Call muse_wait to keep waiting.",
-	not_delivered: "Muse has not received the message yet (the Muse link may be down). Call muse_wait to keep waiting, or tell Leon it is queued."
+	not_delivered: "Muse has not received the message yet (the Muse link may be down). Call muse_wait to keep waiting, or tell Leon it is queued.",
+	waiting_for_approval: "Muse is waiting for Leon's approval in this side chat. Answer it the way Leon would, through Beeper: find Muse's request on the muse network (list_conversations, then list_messages), the newest message like \"Muse is waiting for your approval: … Allow it once with `!muse approval-allow <code>`\". Apply Leon's approval rule: if it does what he asked for (the right action, recipient or site, and content), send exactly `!muse approval-allow <code>` in that chat with send_message and say in the Slack thread what you approved; otherwise send `!muse approval-deny <code>` or ask Leon, mentioning him. Payments, purchases, money transfers and password, login or security changes always go to Leon. If no request has reached Beeper within a minute, tell Leon what Muse is waiting for and mention him. Then call muse_wait."
 };
 function nextStep(status) {
 	return nextSteps[status] ?? "";
@@ -161,6 +162,24 @@ function answerRows(job, receipt, rows, quiet) {
 		}))
 	};
 }
+/**
+* What a waiting tool does about Muse's approvals: report a pending one, ask the relay to measure,
+* finish ("clear"), or keep waiting. Muse is measured after about 20 s of work and every 30 s after,
+* and once more before an answer is returned, since Muse can answer and still wait on an approval.
+* A measurement that doesn't arrive within 20 s never holds back an answer.
+*/
+function approvalDecision(approvals, status, now, waited) {
+	const measured = approvals.wanted > 0 && approvals.checked >= approvals.wanted;
+	if (measured && (approvals.count ?? 0) > 0 && now - approvals.checked < 60) return "pending";
+	const outstanding = approvals.wanted > approvals.checked;
+	if (status === "answered") {
+		if (measured && approvals.checked >= approvals.changed) return "clear";
+		if (outstanding) return now - approvals.wanted > 20 ? "clear" : "wait";
+		return "check";
+	}
+	if (status === "working" && waited >= 20 && !outstanding && now - approvals.wanted >= 30) return "check";
+	return "wait";
+}
 async function runTool(host, tool, args, session, owner, seconds) {
 	if (!host) return { error: "The Muse relay is not running in this gateway." };
 	const current = slackTurn(session, owner);
@@ -189,18 +208,24 @@ async function runTool(host, tool, args, session, owner, seconds) {
 		if (job && tool === "reply") await host.followUp(job.id, text, followUpThread(text));
 	}
 	if (!job) return { error: "No handoff found. Pass the handoff ID that muse_handoff returned." };
-	const deadline = host.now() + seconds;
+	const started = host.now();
+	const deadline = started + seconds;
 	for (let polls = 0;; polls++) {
-		const { status, messages } = await host.answer(job.id);
-		if (status === "answered" || host.now() >= deadline) return {
+		const answer = await host.answer(job.id);
+		const approvals = await host.approvals(job.id);
+		const decision = approvalDecision(approvals, answer.status, host.clock(), host.now() - started);
+		const status = decision === "pending" ? "waiting_for_approval" : answer.status === "answered" && decision !== "clear" ? "working" : answer.status;
+		if (decision === "pending" || decision === "clear" || host.now() >= deadline) return {
 			status,
 			handoff: job.id,
 			side_chat: sideChat(job.id),
 			slack_thread: slackPermalink(job.channel, job.root),
-			messages,
+			messages: answer.messages,
+			...decision === "pending" ? { approvals_pending: approvals.count } : {},
 			next: nextStep(status)
 		};
-		if (polls % 3 === 0) await host.touch(job.id);
+		if (decision === "check") await host.wantApprovals(job.id);
+		else if (polls % 3 === 0) await host.touch(job.id);
 		await host.sleep();
 	}
 }
@@ -257,6 +282,7 @@ function directoryRegistration(current) {
 	return revision ? { revision } : { error: "Muse directory revision unavailable" };
 }
 exports.answerRows = answerRows;
+exports.approvalDecision = approvalDecision;
 exports.collectPlan = collectPlan;
 exports.directoryRegistration = directoryRegistration;
 exports.followUpThread = followUpThread;

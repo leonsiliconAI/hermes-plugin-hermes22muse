@@ -35,6 +35,8 @@ class FakeMuse:
         self.busy = False
         # muse-mcp prefixes sends with its provenance stamp unless the server strips it.
         self.stamp = STAMP
+        self.approvals = 0
+        self.approval_checks = 0
 
     @asynccontextmanager
     async def connect(self):
@@ -57,6 +59,10 @@ class FakeMuse:
 
     async def history(self, chat_id):
         return self.chats[chat_id], False, self.busy
+
+    async def pending_approvals(self, chat_id):
+        self.approval_checks += 1
+        return self.approvals
 
 
 def fake_adapter():
@@ -166,6 +172,19 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         self.assertIsNone(self.store.next_inbound(JOB))
         self.assertEqual(len(self.muse.sends), 1)
+
+    async def test_relay_measures_pending_approvals_only_when_asked(self):
+        self.create()
+        await self.tick()
+        self.assertEqual(self.muse.approval_checks, 0)
+        self.muse.approvals = 1
+        self.store.want_approvals(JOB)
+        await self.tick()
+        approvals = self.store.approvals(JOB)
+        self.assertEqual((approvals["count"], self.muse.approval_checks), (1, 1))
+        self.assertGreaterEqual(approvals["checked"], approvals["wanted"])
+        await self.tick()
+        self.assertEqual(self.muse.approval_checks, 1, "one measurement per request")
 
     async def test_unstamped_send_reads_as_leons_own_and_survives_a_lost_receipt(self):
         self.muse.stamp = ""
@@ -334,6 +353,16 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.next_inbound(JOB)["text"], "Summarize LEON-1 and its open questions")
         self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
 
+    async def test_waiting_tools_report_a_pending_approval(self):
+        self.assertEqual(self.call("muse_handoff", task="Book the usual table for Friday")["status"], "not_delivered")
+        now = relay_module.time.time()
+        with self.store.connection() as db:
+            db.execute("UPDATE handoffs SET approvals=1, approvals_at=?, approvals_wanted=?", (now, now - 1))
+        result = self.call("muse_wait")
+        self.assertEqual((result["status"], result["approvals_pending"]), ("waiting_for_approval", 1))
+        self.assertIn("!muse approval-allow <code>", result["next"])
+        self.assertIn("Payments, purchases, money transfers", result["next"])
+
     async def test_tools_and_guide_ignore_other_people_and_platforms(self):
         for change in ({"user_id": "UOTHER"}, {"platform": "telegram"}, {"scope_id": ""}):
             with self.subTest(change=change):
@@ -345,6 +374,30 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("error", self.call("muse_handoff", task="  "))
         self.assertIn("error", self.call("muse_reply", text="hi", handoff="unknown"))
         self.assertTrue(self.adapter._hermes22muse_owns_request(OWNER, TEAM, CHANNEL, REQUEST))
+
+
+class ApprovalDecisionTests(unittest.TestCase):
+    def decide(self, status, waited=0, now=1000, **approvals):
+        state = {"count": None, "checked": 0, "wanted": 0, "changed": 0, **approvals}
+        return plugin.call(plugin.__file__, "approvalDecision", state, status, now, waited)
+
+    def test_working_handoffs_are_measured_after_20_s_and_every_30_s(self):
+        self.assertEqual(self.decide("working", waited=5), "wait")
+        self.assertEqual(self.decide("working", waited=25), "check")
+        self.assertEqual(self.decide("working", waited=40, wanted=990, checked=995, count=0), "wait")
+        self.assertEqual(self.decide("working", waited=60, wanted=960, checked=965, count=0), "check")
+        self.assertEqual(self.decide("working", waited=25, wanted=995), "wait", "a measurement is outstanding")
+
+    def test_an_answer_is_measured_once_before_it_is_returned(self):
+        self.assertEqual(self.decide("answered", changed=990), "check")
+        self.assertEqual(self.decide("answered", changed=990, wanted=995), "wait")
+        self.assertEqual(self.decide("answered", changed=990, wanted=995, checked=998, count=0), "clear")
+        self.assertEqual(self.decide("answered", changed=990, wanted=970), "clear", "a lost measurement")
+
+    def test_a_fresh_pending_count_is_reported(self):
+        self.assertEqual(self.decide("answered", changed=990, wanted=995, checked=998, count=2), "pending")
+        self.assertEqual(self.decide("working", wanted=995, checked=998, count=1), "pending")
+        self.assertEqual(self.decide("working", waited=10, wanted=900, checked=910, count=1), "wait", "stale")
 
 
 class HistoryTests(unittest.TestCase):
