@@ -20,6 +20,7 @@ from hermes22muse.muse import Message, MuseChat, MuseError, STAMP, history_messa
 from hermes22muse import museweb
 from hermes22muse import relay as relay_module
 from hermes22muse.relay import Relay, Slack, Store, operation_id
+from hermes22muse.turns import STALE, Turns
 
 TEAM, CHANNEL, OWNER = "T001", "C001", "U001"
 BOT_TOKEN = "xoxb-muse-test"
@@ -397,6 +398,174 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 await relay.push_routines(post)
 
 
+    def quiet_for(self, seconds):
+        with self.store.connection() as db:
+            db.execute("UPDATE handoffs SET changed=changed-?", (seconds,))
+
+    async def answered(self, *messages):
+        self.muse.chats[JOB] += list(messages)
+        await self.tick()
+        self.settle()
+        await self.tick()
+        self.quiet_for(relay_module.ANSWER_GRACE)
+        self.assertEqual(self.store.answer(JOB)[0], "answered")
+
+    async def test_unread_muse_answers_wake_hermes_through_autolinear_once(self):
+        sent, clock = [], [1000.0]
+
+        async def post(url, payload, headers):
+            sent.append((url, payload, headers))
+            return 200
+
+        turns = Turns(clock=lambda: clock[0])
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER, turns=turns, post=post)
+        self.create()
+        await self.tick()
+        await self.answered(Message("answer", "assistant", "Test your lipids."))
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
+            # A turn running in the channel may still read it, and gets a moment after it ends.
+            turns.start("session", "turn", CHANNEL)
+            await self.relay.report_unread()
+            turns.end("session", "turn")
+            await self.relay.report_unread()
+            self.assertEqual(sent, [])
+            clock[0] += relay_module.ANSWER_GRACE
+            await self.relay.report_unread()
+            await self.relay.report_unread()
+        [(url, payload, headers)] = sent
+        self.assertEqual(url, "https://autolinear.leonsilicon.ai/muse-answer")
+        self.assertEqual(headers, {"Authorization": "Bearer token"})
+        latest = self.store.handoff(JOB)["nudged"]
+        self.assertEqual(payload, {
+            "id": f"{JOB}:{latest}", "channel": CHANNEL, "thread": REQUEST,
+            "handoff": JOB, "sideChat": f"https://muse.ai/thread/{JOB}",
+        })
+
+        # Muse adds to its answer: that is unread too. Without a token nothing is sent.
+        await self.answered(Message("more", "assistant", "Also check ApoB."))
+        await self.relay.report_unread()
+        self.assertEqual(len(sent), 1)
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
+            await self.relay.report_unread()
+        self.assertEqual(len(sent), 2)
+
+        # An answer a tool returned to Hermes is read.
+        await self.answered(Message("last", "assistant", "That's all."))
+        self.store.mark_collected(JOB)
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
+            await self.relay.report_unread()
+        self.assertEqual(len(sent), 2)
+
+    async def test_autolinear_outages_are_retried_a_minute_later(self):
+        codes = [503, 200]
+
+        async def post(url, payload, headers):
+            return codes.pop(0)
+
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER, turns=Turns(), post=post)
+        self.create()
+        await self.tick()
+        await self.answered(Message("answer", "assistant", "Test your lipids."))
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
+            await self.relay.report_unread()
+            await self.relay.report_unread()
+            self.assertEqual(codes, [200], "waits before trying again")
+            self.relay._unread_retry.clear()
+            await self.relay.report_unread()
+        self.assertEqual(codes, [])
+        self.assertEqual(self.store.unread_answers(OWNER, 0), [])
+
+    async def test_muse_answering_leon_in_the_side_chat_wakes_nobody(self):
+        sent = []
+
+        async def post(url, payload, headers):
+            sent.append(payload)
+            return 200
+
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER, turns=Turns(), post=post)
+        self.create()
+        await self.tick()
+        await self.answered(Message("direct", "user", "Never mind"), Message("ok", "assistant", "OK"))
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
+            await self.relay.report_unread()
+            await self.relay.report_unread()
+        self.assertEqual(sent, [])
+        self.assertEqual(self.store.unread_answers(OWNER, 0), [])
+
+    async def test_running_turns_are_reported_for_channels_only(self):
+        sent = []
+
+        async def post(url, payload, headers):
+            sent.append((url, payload))
+            return 200
+
+        turns = Turns()
+        self.relay = Relay(self.store, self.slack, self.muse, OWNER, turns=turns, post=post)
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
+            await self.relay.report_turns()
+            turns.start("a", "1", "D0DM")
+            await self.relay.report_turns()
+            self.assertEqual(sent, [], "nothing to report")
+            turns.start("b", "1", "C0B")
+            turns.start("c", "1", "G0A")
+            await self.relay.report_turns()
+        self.assertEqual(sent, [("https://autolinear.leonsilicon.ai/turns", {"channels": ["C0B", "G0A"]})])
+
+    def test_answers_from_before_the_upgrade_count_as_read(self):
+        import sqlite3
+
+        directory = self.directory / "old"
+        directory.mkdir()
+        with sqlite3.connect(directory / "relay.db") as db:
+            db.executescript("""
+                CREATE TABLE handoffs (
+                    id TEXT PRIMARY KEY, team TEXT NOT NULL, channel TEXT NOT NULL,
+                    request TEXT NOT NULL, actor TEXT NOT NULL, root TEXT,
+                    root_attempt REAL, due REAL NOT NULL DEFAULT 0, activity REAL NOT NULL,
+                    failures INTEGER NOT NULL DEFAULT 0, busy INTEGER NOT NULL DEFAULT 0,
+                    polled REAL NOT NULL DEFAULT 0, changed REAL NOT NULL DEFAULT 0,
+                    UNIQUE(team, channel, root)
+                );
+                CREATE TABLE transcript (
+                    seq INTEGER PRIMARY KEY, handoff TEXT NOT NULL, id TEXT NOT NULL,
+                    role TEXT NOT NULL, text TEXT NOT NULL, UNIQUE(handoff, id)
+                );
+            """)
+            db.execute("INSERT INTO handoffs(id, team, channel, request, actor, root, activity, changed) "
+                       "VALUES ('old', ?, ?, ?, ?, ?, 0, 1e12)", (TEAM, CHANNEL, REQUEST, OWNER, REQUEST))
+            db.executemany("INSERT INTO transcript(handoff, id, role, text) VALUES ('old', ?, ?, ?)",
+                           [("q", "user", "Question"), ("a", "assistant", "Answer")])
+        store = Store(directory)
+        self.assertEqual(store.handoff("old")["collected"], 2)
+        self.assertEqual(store.unread_answers(OWNER, 0), [])
+
+
+class TurnsTests(unittest.TestCase):
+    def test_a_turn_runs_from_its_first_hook_until_it_ends_or_goes_quiet(self):
+        clock = [0.0]
+        turns = Turns(clock=lambda: clock[0])
+        self.assertEqual(turns.idle(CHANNEL), float("inf"), "no turn since the gateway started")
+        turns.start("session", "turn-1", CHANNEL)
+        turns.start(None, "turn", "C0IGNORED")
+        self.assertEqual(turns.running(), {CHANNEL})
+        self.assertIsNone(turns.idle(CHANNEL))
+        clock[0] = STALE - 1
+        turns.seen("session")
+        clock[0] = STALE + 10
+        self.assertEqual(turns.running(), {CHANNEL}, "a tool call kept it running")
+        turns.end("session", "turn-0")
+        self.assertEqual(turns.running(), {CHANNEL}, "another turn of the session ended")
+        turns.end("session", "turn-1")
+        self.assertEqual(turns.running(), set())
+        clock[0] += 5
+        self.assertEqual(turns.idle(CHANNEL), 5)
+
+        turns.start("other", "turn", CHANNEL)
+        clock[0] += STALE + 1
+        self.assertEqual(turns.running(), set(), "its end was never reported")
+        self.assertEqual(turns.idle(CHANNEL), 0)
+
+
 class ToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         temporary = TemporaryDirectory()
@@ -424,7 +593,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.adapter._register_mentioned_thread = Mock()
         constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
-        with patch.dict(sys.modules, {"hermes_constants": constants}):
+        with patch.dict(sys.modules, {"hermes_constants": constants}), patch.object(plugin, "keep_crash_log"):
             ctx.wire(None, self.adapter)
         self.addAsyncCleanup(self.adapter.disconnect)
         self.session = {"platform": "slack", "scope_id": TEAM, "chat_id": CHANNEL, "thread_id": "",
@@ -478,6 +647,42 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.pending_output(JOB)[-1]["text"], "Sent to Muse as you\nOnly the blockers")
         self.assertEqual(self.store.next_inbound(JOB)["text"], "Summarize LEON-1 and its open questions")
         self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
+
+    async def test_a_tool_that_returns_muses_answer_marks_it_read(self):
+        import time
+
+        self.call("muse_handoff", task="Is keto bad for my LDL?", wait_seconds=0)
+        now = time.time()
+        with self.store.connection() as db:
+            db.execute("UPDATE inbound SET receipt='sent' WHERE handoff=?", (JOB,))
+            db.executemany("INSERT INTO transcript(handoff, id, role, text) VALUES (?, ?, ?, ?)",
+                           [(JOB, "sent", "user", "Is keto bad for my LDL?"),
+                            (JOB, "reply", "assistant", "Test your lipids.")])
+            # Muse is quiet and the relay found no approval waiting since it answered.
+            db.execute("UPDATE handoffs SET busy=0, polled=?, changed=?, approvals=0, approvals_wanted=?, "
+                       "approvals_at=? WHERE id=?", (now, now - 30, now - 2, now - 1, JOB))
+        self.assertEqual([row["id"] for row in self.store.unread_answers(OWNER, now - 3600)], [JOB])
+        self.assertEqual(self.call("muse_wait")["status"], "answered")
+        self.assertEqual(self.store.unread_answers(OWNER, now - 3600), [])
+
+    async def test_turn_hooks_never_get_in_hermess_way(self):
+        self.assertIsNotNone(self.hooks["pre_llm_call"](platform="slack", session_id="s", turn_id="t"))
+        self.assertIsNone(self.hooks["post_tool_call"](session_id="s", tool_name="web_search"))
+        self.assertIsNone(self.hooks["on_session_end"](session_id="s", turn_id="t", completed=True))
+        with patch.object(plugin, "session", side_effect=RuntimeError("no session")):
+            self.hooks["on_session_end"]()
+            self.hooks["post_tool_call"]()
+
+    def test_a_gateway_crash_leaves_every_threads_stack_in_the_log(self):
+        import faulthandler
+
+        with patch.object(plugin, "_crash_log", None), patch.object(faulthandler, "enable") as enable:
+            plugin.keep_crash_log(self.directory)
+            log = plugin._crash_log
+            self.addCleanup(log.close)
+        self.assertEqual(Path(log.name), self.directory / "logs" / "gateway_faulthandler.log")
+        enable.assert_called_once_with(file=log, all_threads=True)
+
 
     async def test_tools_are_always_listed(self):
         # Hermes evaluates a check_fn before the Slack adapter wires the relay and keeps the result.

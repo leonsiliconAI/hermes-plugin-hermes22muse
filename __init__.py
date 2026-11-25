@@ -1,6 +1,7 @@
 """Let Hermes hand Leon's Slack requests to Muse side chats and relay them in a Slack thread."""
 
 import asyncio
+import faulthandler
 import functools
 import json
 import logging
@@ -14,6 +15,7 @@ from .muse import Muse
 from .museweb import ROUTES, MuseApiError, MuseLoginRequired, MuseWeb, MuseWebError
 from .progress import wire_progress_delivery
 from .relay import Relay, Slack, Store, operation_id
+from .turns import Turns
 
 LOG = logging.getLogger(__name__)
 USER_ID = re.compile(r"[UW][A-Z0-9]+")
@@ -204,6 +206,26 @@ def session():
         "platform", "scope_id", "chat_id", "thread_id", "message_id", "user_id")}
 
 
+_crash_log = None
+
+
+def keep_crash_log(home):
+    """Write Python's dump of every thread to logs/gateway_faulthandler.log if the gateway crashes.
+
+    Hermes enables faulthandler on stderr, which Hermes Cloud's supervisor doesn't keep, so the
+    segfault that dropped LEON-509's turn (2026-11-25) left no trace. Runs once Hermes has set up
+    its own faulthandler, which this only points at the file."""
+    global _crash_log
+    try:
+        if _crash_log is None:
+            path = home / "logs" / "gateway_faulthandler.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _crash_log = open(path, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_log, all_threads=True)
+    except Exception:
+        LOG.warning("hermes22muse: could not keep a gateway crash log", exc_info=True)
+
+
 def register(ctx):
     owner = os.getenv("HERMES22MUSE_SLACK_USER_ID", "").strip()
     url = os.getenv("HERMES22MUSE_MCP_URL", "").strip()
@@ -220,6 +242,7 @@ def register(ctx):
 
     relay = None
     web = None
+    turns = Turns()
 
     def app():
         nonlocal web
@@ -336,6 +359,13 @@ def register(ctx):
         return call(__file__, "ownsRequest", user, owner, team or "", channel or "", message_id)
 
     def run_tool(name, args):
+        result = muse_tool(name, args)
+        if relay is not None and result.get("status") == "answered" and result.get("handoff"):
+            # Read: the relay won't ask autolinear to wake Hermes for this answer.
+            relay.store.mark_collected(result["handoff"])
+        return json.dumps(result)
+
+    def muse_tool(name, args):
         store = relay.store if relay else None
         host = None
         if store:
@@ -375,15 +405,15 @@ def register(ctx):
             result = call(__file__, "runTool", host, tool_name, tool_args,
                           session() if store else None, owner, remaining, signed_in)
             if result.get("status") != "waiting_for_approval" or not signed_in:
-                return json.dumps(result)
+                return result
             listed = json.loads(approvals_tool({"handoff": result["handoff"]}))
             if not isinstance(listed, dict) or "approvals" not in listed:
                 result["approvals"] = listed
-                return json.dumps(result)
+                return result
             if listed["approvals"]:
                 result["approvals"] = listed["approvals"]
                 result["approvals_pending"] = len(listed["approvals"])
-                return json.dumps(result)
+                return result
             # No pending approval belongs to this side chat (already answered, expired, or from another chat).
             if deadline - time.monotonic() <= 0:
                 status, messages = store.answer(result["handoff"])
@@ -391,7 +421,7 @@ def register(ctx):
                 result["messages"] = messages
                 result.pop("approvals_pending", None)
                 result["next"] = call(__file__, "nextStep", status, signed_in)
-                return json.dumps(result)
+                return result
             tool_name, tool_args = "wait", {"handoff": result["handoff"]}
 
     def handoff_tool(args, **_):
@@ -517,7 +547,9 @@ def register(ctx):
             return
         from hermes_constants import get_hermes_home
 
-        current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter, muse_token), muse, owner, app())
+        keep_crash_log(get_hermes_home())
+        current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter, muse_token), muse, owner, app(),
+                        turns=turns)
         unwire_progress = wire_progress_delivery(adapter, current.store.progress)
         worker = asyncio.create_task(current.run())
         relay = current
@@ -597,7 +629,32 @@ def register(ctx):
                                    (PROGRESS_SCHEMA, progress_tool, "📋")):
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler,
                           emoji=emoji)
+
+    def track(kind, hook):
+        """Keep `turns` current. Hermes calls this on every turn and tool call, so it never raises."""
+        try:
+            if kind == "start":
+                current = session()
+                if current.get("platform") == "slack":
+                    turns.start(hook.get("session_id"), hook.get("turn_id"), current.get("chat_id"))
+            elif kind == "end":
+                turns.end(hook.get("session_id"), hook.get("turn_id"))
+            else:
+                turns.seen(hook.get("session_id"))
+        except Exception:
+            LOG.debug("hermes22muse: turn tracking skipped", exc_info=True)
+
+    def before_turn(**kwargs):
+        track("start", kwargs)
+        return guide(**kwargs)
+
+    def before_tool(**kwargs):
+        track("seen", kwargs)
+        return plan_first(**kwargs)
+
     ctx.register_platform_handler("slack", wire)
-    ctx.register_hook("pre_llm_call", guide)
-    ctx.register_hook("pre_tool_call", plan_first)
+    ctx.register_hook("pre_llm_call", before_turn)
+    ctx.register_hook("pre_tool_call", before_tool)
+    ctx.register_hook("post_tool_call", lambda **kwargs: track("seen", kwargs))
+    ctx.register_hook("on_session_end", lambda **kwargs: track("end", kwargs))
     ctx.register_hook("pre_gateway_dispatch", observe_slack)

@@ -24,6 +24,17 @@ LOGIN_CHECK = 900
 # Leon's Routine projects in Linear follow his routines in Muse (his rule, 2026-11-25).
 ROUTINES_PUSH = 600
 ROUTINES_URL = "https://autolinear.leonsilicon.ai/routines"
+# autolinear's Worker, which slack22linear's reminders go through (HERMES22MUSE_AUTOLINEAR_URL
+# overrides it). The relay reports the issue channels with a running Hermes turn every HEARTBEAT
+# seconds, so a turn a gateway restart dropped gets a reminder (LEON-509, 2026-11-25).
+AUTOLINEAR_URL = "https://autolinear.leonsilicon.ai"
+HEARTBEAT = 60
+# How often the relay looks for Muse answers that no running turn will read, and how long it leaves
+# them for a turn: after Muse's last change and after the chat's last turn ended.
+TURN_CHECK = 10
+ANSWER_GRACE = 20
+# Answers older than this are left alone.
+UNREAD_WINDOW = 6 * 3600
 # A handoff idle for a day stops polling (policy.ts pollDelay).
 SLEEP = 10 * 365 * 86400
 
@@ -79,6 +90,15 @@ class Store:
                            "approvals_wanted REAL NOT NULL DEFAULT 0"):
                 if column.split()[0] not in columns:
                     db.execute(f"ALTER TABLE handoffs ADD COLUMN {column}")
+            # collected: the transcript row through which a tool returned Muse's answer to Hermes.
+            # nudged: the row through which the relay told autolinear nobody read it. Answers from
+            # before this release count as read.
+            if "collected" not in columns:
+                db.execute("ALTER TABLE handoffs ADD COLUMN collected INTEGER NOT NULL DEFAULT 0")
+                db.execute("UPDATE handoffs SET collected=COALESCE("
+                           "(SELECT MAX(seq) FROM transcript t WHERE t.handoff=handoffs.id), 0)")
+            if "nudged" not in columns:
+                db.execute("ALTER TABLE handoffs ADD COLUMN nudged INTEGER NOT NULL DEFAULT 0")
         self.progress = Progress(self.connection)
 
     @contextmanager
@@ -204,6 +224,30 @@ class Store:
                           [dict(row) for row in rows], QUIET)
             return answer["status"], answer["messages"]
 
+
+    def mark_collected(self, job_id):
+        """A tool returned Muse's finished answer to Hermes."""
+        with self.connection() as db:
+            db.execute("UPDATE handoffs SET collected=MAX(collected, COALESCE("
+                       "(SELECT MAX(seq) FROM transcript WHERE handoff=?), 0)) WHERE id=?", (job_id, job_id))
+
+    def unread_answers(self, actor, since):
+        """Channel handoffs whose newest Muse reply, changed since `since`, Hermes hasn't read."""
+        with self.connection() as db:
+            return db.execute(
+                """SELECT * FROM (
+                       SELECT h.*, (SELECT MAX(seq) FROM transcript t
+                                    WHERE t.handoff=h.id AND t.role='assistant') AS latest
+                       FROM handoffs h
+                       WHERE h.actor=? AND h.root IS NOT NULL AND substr(h.channel, 1, 1) IN ('C', 'G')
+                             AND h.changed>=?
+                   ) WHERE latest > MAX(collected, nudged)""",
+                (actor, since),
+            ).fetchall()
+
+    def mark_nudged(self, job_id, seq):
+        with self.connection() as db:
+            db.execute("UPDATE handoffs SET nudged=MAX(nudged, ?) WHERE id=?", (seq, job_id))
 
     def due(self, actor, running=()):
         with self.connection() as db:
@@ -423,8 +467,12 @@ class Slack:
 
 
 class Relay:
-    def __init__(self, store, slack, muse, actor, web=None):
+    def __init__(self, store, slack, muse, actor, web=None, turns=None, post=None):
         self.store, self.slack, self.muse, self.actor, self.web = store, slack, muse, actor, web
+        self.turns = turns
+        # post(url, payload, headers) -> HTTP status, for autolinear's Worker. Tests pass a fake.
+        self._post = post
+        self._unread_retry = {}
 
     async def pending_approvals(self, muse, job_id):
         """Muse's pending approvals for a side chat: from its app gateway, else muse-mcp's snapshot."""
@@ -498,6 +546,75 @@ class Relay:
                 LOG.warning("hermes22muse: could not send Muse's routines to Linear (%s)",
                             exc or type(exc).__name__)
             await asyncio.sleep(ROUTINES_PUSH)
+
+    async def post_autolinear(self, path, payload):
+        """POST to autolinear's Worker with Hermes's token. Its HTTP status, or None without a token."""
+        token = os.environ.get("AUTOLINEAR_TOKEN", "").strip()
+        if not token:
+            return None
+        url = (os.environ.get("HERMES22MUSE_AUTOLINEAR_URL", "").strip() or AUTOLINEAR_URL).rstrip("/") + path
+        headers = {"Authorization": f"Bearer {token}"}
+        if self._post is not None:
+            return await self._post(url, payload, headers)
+        import httpx
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            return (await client.post(url, json=payload, headers=headers)).status_code
+
+    async def report_turns(self):
+        """Tell autolinear which issue channels have a running turn, so it doesn't remind Hermes there."""
+        channels = sorted(chat for chat in self.turns.running() if chat.startswith(("C", "G")))
+        if channels:
+            status = await self.post_autolinear("/turns", {"channels": channels})
+            if status is not None and not 200 <= status < 300:
+                LOG.warning("hermes22muse: autolinear refused the running turns (%s)", status)
+
+    async def report_unread(self):
+        """Ask autolinear to wake Hermes for each Muse answer that no running turn will read: Hermes
+        didn't wait for it, or a gateway restart dropped the turn that was waiting (LEON-509)."""
+        now = time.time()
+        for job in self.store.unread_answers(self.actor, now - UNREAD_WINDOW):
+            idle = self.turns.idle(job["channel"])
+            if (idle is None or idle < ANSWER_GRACE or now - job["changed"] < ANSWER_GRACE
+                    or self._unread_retry.get(job["id"], 0) > time.monotonic()):
+                continue
+            status, messages = self.store.answer(job["id"])
+            if status != "answered":
+                continue
+            if any(message["from"] != "muse" for message in messages):
+                # Leon wrote in the side chat himself, and Muse answered him there.
+                self.store.mark_nudged(job["id"], job["latest"])
+                continue
+            code = await self.post_autolinear("/muse-answer", {
+                "id": f"{job['id']}:{job['latest']}", "channel": job["channel"], "thread": job["root"],
+                "handoff": job["id"], "sideChat": call(__file__, "sideChat", job["id"]),
+            })
+            if code is None:
+                return
+            if 200 <= code < 300 or code == 400:
+                self.store.mark_nudged(job["id"], job["latest"])
+                LOG.info("hermes22muse: asked autolinear to wake Hermes for Muse's answer in %s (%s)",
+                         job["id"], code)
+            else:
+                self._unread_retry[job["id"]] = time.monotonic() + 60
+                LOG.warning("hermes22muse: autolinear refused Muse's unread answer in %s (%s)", job["id"], code)
+
+    async def watch_turns(self):
+        beat = float("-inf")
+        while True:
+            await asyncio.sleep(TURN_CHECK)
+            if not self.slack.adapter._running:
+                continue
+            if time.monotonic() - beat >= HEARTBEAT:
+                beat = time.monotonic()
+                try:
+                    await asyncio.wait_for(self.report_turns(), 30)
+                except Exception as exc:
+                    LOG.warning("hermes22muse: could not report running turns (%s)", exc or type(exc).__name__)
+            try:
+                await asyncio.wait_for(self.report_unread(), 60)
+            except Exception as exc:
+                LOG.warning("hermes22muse: could not report unread Muse answers (%s)", exc or type(exc).__name__)
 
     async def send_to_muse(self, muse, job, entry):
         async def history(job_id):
@@ -593,6 +710,8 @@ class Relay:
                 tasks.create_task(self.publish_progress())
                 if self.web is not None:
                     tasks.create_task(self.sync_routines())
+                if self.turns is not None:
+                    tasks.create_task(self.watch_turns())
                 while True:
                     if self.web is not None and time.monotonic() - login_checked > LOGIN_CHECK:
                         login_checked = time.monotonic()

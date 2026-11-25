@@ -61,6 +61,17 @@ Leon's routines are scheduled tasks in Muse, and each one is also a project in L
 
 The routing guide tells Hermes the rest: a routine is made in Muse (through `muse_handoff`) and managed with `muse_app` (`tasks.list`, `tasks.pause`, `tasks.resume`, `tasks.delete`), and a standing watch is a project in the **Watcher** status, which [Autotrigger](../../packages/ai/leonsilicon/services/autotrigger/README.md#watchers) turns into an issue per case.
 
+## Dropped turns
+
+A gateway restart drops the turns it was running and never resumes them. On 2026-11-25 the gateway crashed with a segmentation fault 16 seconds after Muse answered LEON-509, while Hermes's turn waited in `muse_wait`. The answer sat in the thread, nothing moved the issue, and Leon found it an hour later. The relay now tells [autolinear](../autolinear/README.md)'s Worker enough for Autolinear to remind Hermes:
+
+- Hermes's turn hooks (`pre_llm_call`, `pre_tool_call`, `post_tool_call`, `on_session_end`) keep a list of the Slack chats with a running turn, in memory, so a restart empties it. A turn with no hook for ten minutes counts as ended. Every minute the relay posts the issue channels on that list to `/turns`. [slack22linear](../../packages/ai/leonsilicon/services/slack22linear/README.md#what-it-does) reminds Hermes about a turn it took up (👀) that hasn't ended (✅ or ❌) five minutes after its channel last showed up there.
+- A Muse answer counts as read once `muse_handoff`, `muse_reply` or `muse_wait` returns it as `answered`. When a finished answer in a channel stays unread while no turn runs there, for 20 seconds after Muse's last change and after the chat's last turn ended, the relay posts it to `/muse-answer` once. Autolinear then asks Hermes in the handoff's thread to read it with `muse_wait`. This also covers Hermes ending its turn without waiting for Muse. Answers Muse gives to Leon's own messages in the side chat, answers older than six hours, and DM handoffs are left alone. Answers from before 2.12.0 count as read.
+
+Both use `AUTOLINEAR_TOKEN` from the Hermes profile's environment. `HERMES22MUSE_AUTOLINEAR_URL` overrides the Worker's address. Without the token nothing is sent, and the log says `could not report running turns` or `could not report unread Muse answers` when a post fails.
+
+The plugin also points the faulthandler that Hermes enables at `$HERMES_HOME/logs/gateway_faulthandler.log`. The gateway's standard error goes to Hermes Cloud's console, which isn't kept, so the next crash leaves a stack of every thread there. `s6-svdt /run/hermes-service/gateway-default` lists how the gateway's recent runs ended.
+
 ## Sign Hermes in to muse.ai
 
 The Muse app tools need the user's muse.ai login, saved once as `$HERMES_HOME/hermes22muse/muse-login.json` (mode 600). Give Hermes a login of its own: muse.ai can replace the login cookie whenever it is used and drop the old one, so a login shared with a browser signs one of them out.
