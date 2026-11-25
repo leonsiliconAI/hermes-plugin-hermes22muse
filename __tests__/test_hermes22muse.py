@@ -779,13 +779,13 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.call("slack_task_progress")["latest_answer"],
                          "Verified the result.\n\n@Autolinear move done")
 
-    async def test_a_new_task_shows_hermes_plan_before_any_work(self):
+    async def test_a_new_task_shows_hermes_quick_answer_before_any_work(self):
         root = (await self.build_turn()).source.thread_id
         route = (TEAM, CHANNEL, root)
         check = self.hooks["pre_tool_call"]
         publisher = Slack(self.adapter, BOT_TOKEN)
 
-        # Leon's follow-up in the thread doesn't owe a plan; only the request that opened the card does.
+        # Leon's follow-up in the thread doesn't owe a quick answer; only the request that opened the card does.
         self.session.update(thread_id=root, message_id=LATER)
         self.assertNotIn("[Task progress]", self.hooks["pre_llm_call"](platform="slack")["context"])
         self.assertIsNone(check(tool_name="terminal", args={}))
@@ -793,35 +793,42 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.session.update(message_id=REQUEST)
         guide = self.hooks["pre_llm_call"](platform="slack")["context"]
         self.assertTrue(guide.startswith("[Task progress]"))
-        self.assertIn("Before any other tool, call slack_task_progress with plan", guide)
+        self.assertIn("Before any other tool, call slack_task_progress with quick_answer", guide)
+        self.assertIn("give your best answer now and say what you'll check", guide)
         self.assertIsNone(check(tool_name="slack_task_progress", args={}))
         blocked = check(tool_name="terminal", args={"command": "gcal list"})
         self.assertEqual(blocked["action"], "block")
-        self.assertIn("Call slack_task_progress with plan", blocked["message"])
-        # Asked once: Hermes can go on working without a plan.
+        self.assertIn("Call slack_task_progress with quick_answer", blocked["message"])
+        # Asked once: Hermes can go on working without a quick answer.
         self.assertIsNone(check(tool_name="terminal", args={"command": "gcal list"}))
 
-        self.assertIn("error", self.call("slack_task_progress", plan="  "))
-        result = self.call("slack_task_progress", plan="I'll find the Thursday Game Night series on your "
-                                                         "calendar and delete every occurrence.\n\n<!channel>")
+        self.assertIn("error", self.call("slack_task_progress", quick_answer="  "))
+        result = self.call("slack_task_progress", quick_answer="Probably 12 events, every Thursday since "
+                                                                 "September. I'll delete them all and check that "
+                                                                 "none are left.\n\n<!channel>")
         self.assertTrue(result["queued"])
-        self.assertTrue(result["plan"].startswith("I'll find"))
+        self.assertTrue(result["quick_answer"].startswith("Probably 12 events"))
         await self.store.progress.flush(publisher)
         update = self.client.chat_update.await_args.kwargs
         self.assertEqual(update["ts"], root)
-        self.assertEqual(update["text"], "*Task progress*\n\n*Plan from Hermes*\nI'll find the Thursday Game "
-                                         "Night series on your calendar and delete every occurrence.\n&lt;!channel&gt;")
+        self.assertEqual(update["text"], "*Task progress*\n\n*Quick answer from Hermes*\nProbably 12 events, every "
+                                         "Thursday since September. I'll delete them all and check that none are "
+                                         "left.\n&lt;!channel&gt;")
         self.assertNotIn("[Task progress]", self.hooks["pre_llm_call"](platform="slack")["context"])
 
-        # The outcome joins the plan; slack22linear still reads only the answer after its heading.
+        # The full answer joins the quick one; slack22linear still reads only the answer after its heading.
         self.store.progress.finish(route, "Removed all 12 events.\n\n@Autolinear move done")
         await self.store.progress.flush(publisher)
         text = self.client.chat_update.await_args.kwargs["text"]
-        self.assertIn("*Plan from Hermes*\nI'll find", text)
+        self.assertIn("*Quick answer from Hermes*\nProbably 12 events", text)
         heading = "\n\n*Update from Hermes*\n"
         self.assertEqual(text.count(heading), 1)
         self.assertEqual(text[text.index(heading) + len(heading):],
                          "Removed all 12 events.\n\n@Autolinear move done")
+
+        # A session that started before 2.13.0 still has the plan wording.
+        result = self.call("slack_task_progress", plan="I'll check the calendar again.")
+        self.assertEqual(result["quick_answer"], "I'll check the calendar again.")
 
     async def test_cards_from_before_plans_keep_working(self):
         with self.store.connection() as db:

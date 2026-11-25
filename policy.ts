@@ -155,7 +155,8 @@ export function progressMessage(
   if (threadLink)
     lines[0] += " · <" + slackPermalink(channel, threadLink) + "|Collaboration thread>";
   // No blank lines: slack22linear finds Hermes's answer by the blank line before its heading.
-  if (plan) lines.push("\n*Plan from Hermes*\n" + escapeSlack(plan.replace(/\n\s*\n/g, "\n")));
+  if (plan)
+    lines.push("\n*Quick answer from Hermes*\n" + escapeSlack(plan.replace(/\n\s*\n/g, "\n")));
   if (summary) {
     const quoted = summary.split(/\r?\n/).map((line) => "> " + escapeSlack(line));
     lines.push("\n" + quoted.join("\n"));
@@ -363,21 +364,27 @@ export function startsTaskThread(
   );
 }
 
-/** Shown on Leon's request that opened a Task progress message, which is empty until Hermes says what it will do. */
+/**
+ * Shown on Leon's request that opened a Task progress message, which is empty until Hermes answers.
+ * Leon asked for a short answer within seconds and the full one when the work is done (2026-11-25).
+ */
 export function planGuide() {
   return (
     "[Task progress] This request opened the issue's Task progress message, which Leon sees with nothing on it yet. " +
-    "Before any other tool, call slack_task_progress with plan: one to three sentences to Leon saying what you will do, " +
-    "the way you would open a reply to him (for example: I'll find the recurring event on your calendar, delete every " +
-    "occurrence, and check that none are left). Then do the work and give the outcome in your final response as usual."
+    "Before any other tool, call slack_task_progress with quick_answer: your short first answer to Leon, in one to " +
+    "three sentences, from what you already know. He reads it within seconds, then waits for your full answer. " +
+    "If he asked a question, give your best answer now and say what you'll check before the full answer; call a guess " +
+    "a guess. If he asked you to do something, say what you'll do (for example: I'll find the recurring event on your " +
+    "calendar, delete every occurrence, and check that none are left). Never say something is done or confirmed " +
+    "before you have checked it. Then do the work and give the full answer in your final response as usual."
   );
 }
 
-/** The tool result when Hermes starts work on a new task without saying what it will do. */
+/** The tool result when Hermes starts work on a new task before giving Leon its quick answer. */
 export function planFirst() {
   return (
-    "Not run yet: Task progress doesn't say what you'll do. Call slack_task_progress with plan (one to three " +
-    "sentences to Leon on what you will do for this request), then call this tool again."
+    "Not run yet: Task progress still shows Leon nothing. Call slack_task_progress with quick_answer (one to three " +
+    "sentences: your best answer so far and what you'll check, or what you'll do), then call this tool again."
   );
 }
 

@@ -176,18 +176,20 @@ PROGRESS_SCHEMA = {
     "name": "slack_task_progress",
     "description": (
         "Read the latest Hermes answer and the Grok Bot, Muse and Codex updates for this Slack task. "
-        "With plan, show Leon at the top of Task progress what you will do for this task. "
+        "With quick_answer, show Leon your short first answer at the top of Task progress before you start the work. "
         "With summary, replace the current status with checked milestones, blockers and next steps. "
-        "Give your final response normally so Hermes can save it to Task progress."
+        "Give your full answer as your final response so Hermes can save it to Task progress."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "thread_ts": {"type": "string", "description": "Exact root timestamp in this Slack channel. "
                                                           "Defaults to the current thread."},
-            "plan": {"type": "string", "maxLength": 600,
-                     "description": "One to three sentences to Leon on what you will do. Set it before starting "
-                                    "a new task, and again if Leon changes the task."},
+            "quick_answer": {"type": "string", "maxLength": 600,
+                             "description": "One to three sentences to Leon from what you already know: your best "
+                                            "answer so far and what you'll check, or what you'll do. Nothing in it "
+                                            "is done or confirmed unless you checked it. Set it before starting a "
+                                            "new task, and again if Leon changes the task."},
             "summary": {"type": "string", "maxLength": 1200, "description": "Your reviewed progress summary."},
         },
         "additionalProperties": False,
@@ -445,10 +447,11 @@ def register(ctx):
             return json.dumps({"error": "Use the exact Slack root timestamp."})
         route = (team, channel, root)
         entry = progress.read(route)
-        plan = args.get("plan")
+        # Before 2.13.0 the quick answer was a plan; sessions that started then may still send `plan`.
+        plan = args.get("quick_answer", args.get("plan"))
         if plan is not None:
             if not isinstance(plan, str) or not plan.strip() or len(plan) > 600:
-                return json.dumps({"error": "Use a plan between 1 and 600 characters."})
+                return json.dumps({"error": "Use a quick answer between 1 and 600 characters."})
             if root != current_root and entry is None:
                 return json.dumps({"error": "That collaboration thread is unknown in this channel."})
             progress.set_plan(route, plan.strip())
@@ -463,7 +466,7 @@ def register(ctx):
             entry = progress.read(route)
         if entry is None:
             return json.dumps({"thread_ts": root, "recent_tasks": progress.recent(team, channel)})
-        return json.dumps({"thread_ts": root, "progress_ts": entry["card"], "plan": entry["plan"],
+        return json.dumps({"thread_ts": root, "progress_ts": entry["card"], "quick_answer": entry["plan"],
                            "summary": entry["summary"], "latest_answer": entry["answer"],
                            "reports": entry["reports"], "queued": entry["published"] < entry["version"]})
 
@@ -487,7 +490,7 @@ def register(ctx):
     reminded = set()
 
     def plan_first(tool_name="", **_):
-        """Turn away the first other tool of a new task until Task progress says what Hermes will do.
+        """Turn away the first other tool of a new task until Task progress shows Hermes's quick answer.
 
         Hermes blocks every tool when this hook raises or hangs, so it stays in Python and SQLite and
         catches everything. The card's row already shows that Leon's own message opened it."""
@@ -498,7 +501,7 @@ def register(ctx):
             if current.get("platform") != "slack" or current.get("user_id") != owner or not needs_plan(current):
                 return None
             route = (current["scope_id"], current["chat_id"], current["thread_id"])
-            # Ask once: Hermes keeps working even if it doesn't set a plan.
+            # Ask once: Hermes keeps working even if it doesn't give a quick answer.
             if route in reminded:
                 return None
             reminded.add(route)
