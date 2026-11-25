@@ -4,7 +4,7 @@ Hermes can hand research and complex work to Muse side chats, review Muse’s an
 
 1. Hermes works out the request from the conversation and chooses the agents it needs. When it chooses Muse, Hermes writes a self-contained brief in the user’s own voice and sends it through `muse_handoff`.
 2. The `slack22muse` app posts Muse’s replies as **Muse** in the channel thread. For a one-to-one DM with Hermes, it opens a separate thread in the **Muse** DM and links back to the original request. Hermes checks the replies, sends follow-ups with `muse_reply`, and uses `muse_wait` when Muse needs more than about five minutes.
-3. Hermes gives a reviewed answer in the task thread. For ordinary channel messages outside issue channels, [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts answers at the top level.
+3. Hermes edits **Task progress** with its reviewed answer. For ordinary channel messages outside issue channels, [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts answers at the top level.
 
 Replies in existing handoff threads keep their Muse context. Messages typed directly in the side chat appear in Slack with a “You in Muse” label. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
 
@@ -18,11 +18,11 @@ In Slack, use [slack22orca](../hermes-plugin-slack22orca/README.md) 1.1.0 or lat
 
 ## Shared task thread and progress
 
-On Leon's first request in a new issue channel, Hermes posts **Task progress** at the top level and uses it as the root of the task thread. Hermes and the delegated agents reply there. Use the issue channel ID and the **Task progress** timestamp for each handoff. `slack22muse` posts as Muse in that thread. [slack22chatgpt](../../packages/ai/leonsilicon/services/slack22chatgpt/README.md) gives Codex the same thread through Slack Puppet, and [slack22grokbot](../../packages/ai/leonsilicon/services/slack22grokbot/README.md) relays the thread to Grok Bot. Use the channel AutoLinear creates when the request starts in a DM.
+On Leon's first request in a new issue channel, Hermes posts **Task progress** at the top level and uses it as the root of the task thread. Use the issue channel ID and the **Task progress** timestamp for each handoff. `slack22muse` posts as Muse in that thread. [slack22chatgpt](../../packages/ai/leonsilicon/services/slack22chatgpt/README.md) gives Codex the same thread through Slack Puppet, and [slack22grokbot](../../packages/ai/leonsilicon/services/slack22grokbot/README.md) relays the thread to Grok Bot. Use the channel AutoLinear creates when the request starts in a DM.
 
 - Start a reply with `To Muse:` to route a Grok Bot or Codex message to the existing Muse side chat. Hermes labels it as peer input. Retries and edits update the Slack record without forwarding the same reply again.
 - Muse’s replies can start with `To Codex:` or `To Grok Bot:`. Codex reads the shared thread through Slack Puppet. Grok Bot receives peer replies through its conversation bridge. Hermes handles Leon’s follow-ups to Muse with `muse_reply`.
-- Hermes edits **Task progress** as reports arrive, with links to the latest reply from each agent. The message and pending updates survive a gateway restart. `slack_task_progress` reads it from the current thread and accepts a `summary` with Hermes’s checked milestones, blockers, and next steps. Autolinear commands still control the Linear issue status.
+- Hermes edits **Task progress** with its latest response, including the final outcome. Drafts wait for the completed response. Explicit follow-ups addressed to an agent remain thread replies. The card also links to the latest reply from each agent and survives gateway restarts along with pending updates. `slack_task_progress` can show the latest answer or replace it with a checked progress summary. Autolinear reads Hermes’s status commands from the edited card.
 - Existing collaborations keep the thread their agents joined. Their progress message links to that thread.
 
 Update [slack-as-leon-guard](../hermes-plugin-slack-as-leon-guard/README.md) to 1.3.0 or later so reports and Hermes’s replies stay in the collaboration thread. Install the current Beeper inbox release and configure Slack Puppet for the Codex environments that will join.
@@ -103,7 +103,7 @@ hermes plugins install leonsiliconAI/hermes-plugin-hermes22muse --enable --yes-d
 
 If the profile runs AutoLinear, use 1.6.0 or later. AutoLinear creates the issue and channel, and Hermes decides how to handle the request there. Replies in a Muse handoff thread stay there. Keep the separate AutoLinear Slack app’s message event subscriptions paused so intake starts in the gateway and can recognize those replies.
 
-For an existing installation, run `hermes plugins update hermes22muse` and restart the gateway. Look for `hermes22muse: Muse handoff relay registered`. Verify that a routine request in a new issue channel gets an answer under **Task progress**, and that an explicit Muse research request relays the side chat in the same thread. For a DM request sent to Muse, check the separate conversation with Muse.
+For an existing installation, run `hermes plugins update hermes22muse` and restart the gateway. Look for `hermes22muse: Muse handoff relay registered`. Verify that a routine request in a new issue channel updates **Task progress**, and that an explicit Muse research request relays the side chat in its thread. For a DM request sent to Muse, check the separate conversation with Muse.
 
 ## Delivery and recovery
 

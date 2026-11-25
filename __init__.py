@@ -12,6 +12,7 @@ from contextlib import suppress
 from ._pythonmonkey import blocking, call
 from .muse import Muse
 from .museweb import ROUTES, MuseApiError, MuseLoginRequired, MuseWeb, MuseWebError
+from .progress import wire_progress_delivery
 from .relay import Relay, Slack, Store, operation_id
 
 LOG = logging.getLogger(__name__)
@@ -172,10 +173,9 @@ FILE_SCHEMA = {
 PROGRESS_SCHEMA = {
     "name": "slack_task_progress",
     "description": (
-        "Read the latest Grok Bot, Muse and Codex updates for this Slack task. With summary, queue an "
-        "edit to the task's top-level progress message with your checked milestones, blockers and next "
-        "steps. The Task progress message hosts the discussion for new Slack issues. "
-        "This does not move the Linear issue."
+        "Read the latest Hermes answer and the Grok Bot, Muse and Codex updates for this Slack task. "
+        "With summary, replace the current status with checked milestones, blockers and next steps. "
+        "Give your final response normally so Hermes can save it to Task progress."
     ),
     "parameters": {
         "type": "object",
@@ -422,6 +422,7 @@ def register(ctx):
         if entry is None:
             return json.dumps({"thread_ts": root, "recent_tasks": progress.recent(team, channel)})
         return json.dumps({"thread_ts": root, "progress_ts": entry["card"], "summary": entry["summary"],
+                           "latest_answer": entry["answer"],
                            "reports": entry["reports"], "queued": entry["published"] < entry["version"]})
 
     def guide(**kwargs):
@@ -477,6 +478,7 @@ def register(ctx):
         from hermes_constants import get_hermes_home
 
         current = Relay(Store(get_hermes_home() / "hermes22muse"), Slack(adapter, muse_token), muse, owner, app())
+        unwire_progress = wire_progress_delivery(adapter, current.store.progress)
         worker = asyncio.create_task(current.run())
         relay = current
         adapter._hermes22muse_worker = worker
@@ -512,6 +514,8 @@ def register(ctx):
                 else:
                     source.thread_id = root
                     turn.reply_to_message_id = root
+                    # Slack still sends to source.thread_id. The original anchor identifies streamed replies.
+                    turn.reply_anchor_override = source.message_id
                     register_thread = getattr(adapter, "_register_mentioned_thread", None)
                     if callable(register_thread):
                         register_thread(root, source.scope_id)
@@ -529,6 +533,7 @@ def register(ctx):
                 with suppress(asyncio.CancelledError):
                     await worker
             finally:
+                unwire_progress()
                 if relay is current:
                     relay = None
                 del adapter._hermes22muse_owns_request

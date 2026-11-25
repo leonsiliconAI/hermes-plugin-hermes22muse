@@ -1,6 +1,7 @@
 """Open and update the Slack message that hosts an issue's collaboration thread."""
 
 import asyncio
+import functools
 import logging
 import time
 import uuid
@@ -29,6 +30,8 @@ class Progress:
                     PRIMARY KEY(team, channel, root, agent)
                 );
             """)
+            if not any(row["name"] == "answer" for row in db.execute("PRAGMA table_info(progress)")):
+                db.execute("ALTER TABLE progress ADD COLUMN answer TEXT NOT NULL DEFAULT ''")
 
     async def open_thread(self, slack, team, channel):
         """Return the issue's thread, posting the top-level progress message on first use."""
@@ -42,7 +45,7 @@ class Progress:
             if existing is not None:
                 return existing["root"]
             ts = await self._publish(slack, dict(team=team, channel=channel, root=None,
-                                                card=None, summary="", reports=[]))
+                                                card=None, summary="", reports=[], answer=""))
             with self.connection() as db:
                 db.execute("INSERT INTO progress(team, channel, root, card) VALUES (?, ?, ?, ?)",
                            (team, channel, ts, ts))
@@ -81,8 +84,18 @@ class Progress:
     def update(self, route, summary):
         with self.connection() as db:
             self._changed(db, route)
-            db.execute("UPDATE progress SET summary=? WHERE team=? AND channel=? AND root=?",
+            db.execute("UPDATE progress SET summary=?, answer='' WHERE team=? AND channel=? AND root=?",
                        (summary, *route))
+
+    def has_card(self, route):
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM progress WHERE team=? AND channel=? AND root=? AND card IS NOT NULL",
+                              route).fetchone() is not None
+
+    def finish(self, route, answer):
+        with self.connection() as db:
+            db.execute("UPDATE progress SET version=version+1, summary='', answer=? "
+                       "WHERE team=? AND channel=? AND root=? AND answer!=?", (answer, *route, answer))
 
     def recent(self, team, channel):
         with self.connection() as db:
@@ -130,7 +143,8 @@ class Progress:
         channel, root = entry["channel"], entry["root"]
         client = slack.client(entry)
         thread_link = root if root != entry["card"] else None
-        text = call(__file__, "progressMessage", channel, thread_link, entry["summary"], entry["reports"])
+        text = call(__file__, "progressMessage", channel, thread_link, entry["summary"], entry["reports"],
+                    entry["answer"])
         args = dict(channel=channel, text=text, link_names=False)
         if entry["card"]:
             response = await asyncio.wait_for(client.chat_update(ts=entry["card"], **args), 15)
@@ -142,3 +156,70 @@ class Progress:
                 or (entry["card"] and response["ts"] != entry["card"])):
             raise RuntimeError("Slack returned no matching progress message")
         return response["ts"]
+
+
+def wire_progress_delivery(adapter, progress):
+    """Use the progress message for completed gateway replies on an existing task route."""
+    send = getattr(adapter, "send", None)
+    draft = getattr(adapter, "send_draft", None)
+    final = getattr(adapter, "send_final_ledgered", None)
+    if not (callable(send) and callable(final)):
+        return lambda: None
+
+    from gateway.platforms.base import SendResult
+
+    active = True
+
+    def card_route(chat_id, metadata):
+        if active and metadata and metadata.get("slack_team_id") and metadata.get("thread_id"):
+            route = (metadata["slack_team_id"], chat_id, metadata["thread_id"])
+            if not adapter._outbound_blocked(chat_id, "Slack task progress") and progress.has_card(route):
+                return route
+        return None
+
+    @functools.wraps(send)
+    async def send_to_progress(chat_id, content, reply_to=None, metadata=None):
+        if metadata and (metadata.get("expect_edits") or
+                         (metadata.get("notify") and (metadata.get("reply_to_message_id") or
+                                                      metadata.get("_hermes_task_answer")))):
+            route = card_route(chat_id, metadata)
+            if route:
+                if metadata.get("expect_edits"):
+                    # The edit-stream consumer will deliver the completed text at the end of the turn.
+                    return SendResult(success=False, error="Task progress uses completed replies")
+                if call(__file__, "publishTaskAnswer", content):
+                    progress.finish(route, adapter.format_message(content).strip())
+                    # The durable queue owns delivery. The consumer must never treat the parent as a draft ID.
+                    return SendResult(success=True)
+        return await send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    @functools.wraps(final)
+    async def final_to_progress(event, session_key, text_content, metadata, *, reply_to,
+                                is_ephemeral_response=False):
+        if not is_ephemeral_response and not event.is_command():
+            metadata = {**metadata, "_hermes_task_answer": True}
+        return await final(event, session_key, text_content, metadata, reply_to=reply_to,
+                           is_ephemeral_response=is_ephemeral_response)
+
+    adapter.send = send_to_progress
+    adapter.send_final_ledgered = final_to_progress
+    if callable(draft):
+        @functools.wraps(draft)
+        async def buffer_draft(chat_id, draft_id, content, metadata=None):
+            if card_route(chat_id, metadata):
+                return SendResult(success=True)  # A draft receipt has no message ID.
+            return await draft(chat_id, draft_id, content, metadata=metadata)
+
+        adapter.send_draft = buffer_draft
+
+    def unwire():
+        nonlocal active
+        active = False
+        if adapter.send is send_to_progress:
+            adapter.send = send
+        if adapter.send_final_ledgered is final_to_progress:
+            adapter.send_final_ledgered = final
+        if callable(draft) and adapter.send_draft is buffer_draft:
+            adapter.send_draft = draft
+
+    return unwire

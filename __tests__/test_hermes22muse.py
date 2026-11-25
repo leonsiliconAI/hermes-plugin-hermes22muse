@@ -526,6 +526,17 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("To Codex: The limit is 20.", update["text"])
         self.assertFalse(self.call("slack_task_progress")["queued"])
 
+        progress.finish(route, "Verified the result.\n\n@Autolinear move done")
+        with self.store.connection() as db:
+            progress.report(db, route, "Codex", "1795000201.000001", "1795000201.000001", "Confirmed.")
+        await Store(self.store.directory).progress.flush(publisher)
+        update = self.client.chat_update.await_args.kwargs
+        self.assertEqual(update["ts"], root)
+        self.assertIn("Confirmed.", update["text"])
+        self.assertIn("Verified the result.\n\n@Autolinear move done", update["text"])
+        self.assertEqual(self.call("slack_task_progress")["latest_answer"],
+                         "Verified the result.\n\n@Autolinear move done")
+
     async def test_keeps_existing_slack_threads_and_retries_a_failed_open(self):
         self.assertIsNone((await self.build_turn(name="general")).source.thread_id)
         self.assertEqual((await self.build_turn(LATER, thread_ts=REQUEST)).source.thread_id, REQUEST)
