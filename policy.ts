@@ -562,6 +562,18 @@ interface PreviewBlock {
   items?: { label?: string; url?: string }[];
 }
 
+interface DecisionOption {
+  kind?: string;
+  label_text?: string;
+  label?: { scope?: string };
+}
+
+function decisionOptions(approval: RawApproval): DecisionOption[] {
+  return (approval.decision_options ?? []).map((option) =>
+    typeof option === "string" ? { kind: option } : option,
+  );
+}
+
 interface RawApproval {
   approval_id?: string;
   approval_type?: string;
@@ -570,7 +582,17 @@ interface RawApproval {
   request_expires_at_ms?: number;
   session_id?: string;
   message_revision?: number;
-  decision_options?: { kind?: string; label_text?: string; label?: { scope?: string } }[];
+  /** Muse sends the choices as names, or as objects with a label. */
+  decision_options?: (string | DecisionOption)[];
+  reason?: string;
+  short_explanation?: string;
+  action_label?: string;
+  display_name?: string;
+  host?: string;
+  method?: string;
+  path?: string;
+  policy_subject?: string;
+  runtime_request_trace?: { thread_id?: string };
   display?: {
     display_name?: string;
     card_title?: string;
@@ -610,6 +632,7 @@ function previewLines(blocks: PreviewBlock[] | undefined) {
 function approvalChat(approval: RawApproval) {
   const scope = approval.scope ?? {};
   for (const value of [
+    approval.runtime_request_trace?.thread_id,
     approval.session_id,
     scope.session_id,
     scope.thread_id,
@@ -623,11 +646,16 @@ function approvalChat(approval: RawApproval) {
 function approvalNeedsLeon(approval: RawApproval) {
   const display = approval.display ?? {};
   const question = display.permission_question?.kind ?? "";
-  if (moneyWords.test(approval.approval_type ?? "") || moneyWords.test(question))
+  if (
+    [approval.approval_type, question, approval.method, approval.policy_subject].some((text) =>
+      moneyWords.test(text ?? ""),
+    )
+  )
     return "it spends or moves money";
   for (const key of Object.keys(approval))
-    if (/checkout|payment/i.test(key) && approval[key]) return "it spends or moves money";
-  if (!display.card_title && !display.permission_question?.text)
+    if (/checkout|payment/i.test(key) && approval[key] && typeof approval[key] === "object")
+      return "it spends or moves money";
+  if (!display.card_title && !display.permission_question?.text && !approval.reason)
     return "it does not say what it allows";
 }
 
@@ -638,17 +666,23 @@ export function approvalSummary(approval: RawApproval) {
   return {
     approval: approval.approval_id,
     side_chat_id: approvalChat(approval),
-    asks: assistantName(display.card_title || display.permission_question?.text),
-    kind: display.permission_question?.kind ?? approval.approval_type ?? approval.payload?.type,
-    summary: assistantName(display.scope_summary || display.summary_title),
-    purpose: display.purpose_summary || display.reason,
+    asks: assistantName(display.card_title || display.permission_question?.text || approval.reason),
+    kind:
+      display.permission_question?.kind ??
+      approval.approval_type ??
+      approval.method ??
+      approval.payload?.type,
+    summary: assistantName(
+      display.scope_summary || display.summary_title || approval.short_explanation,
+    ),
+    purpose: display.purpose_summary || display.reason || approval.action_label,
     details: previewLines(display.request_preview_document?.blocks),
     target: connector
       ? [display.display_name, connector.host, connector.method].filter(Boolean).join(" · ")
-      : display.display_name,
-    options: (approval.decision_options ?? []).map((option) => ({
+      : [display.display_name ?? approval.display_name, approval.path].filter(Boolean).join(" · "),
+    options: decisionOptions(approval).map((option) => ({
       decision: option.kind,
-      label: option.label_text,
+      ...(option.label_text ? { label: option.label_text } : {}),
       ...(option.label?.scope ? { scope: option.label.scope } : {}),
     })),
     requested: approval.requested_at_ms
@@ -704,14 +738,16 @@ export function approvalDecide(
     return { error: "No pending approval has that ID. Call muse_approvals for the current ones." };
   if (!decisions.includes(decision))
     return { error: "decision must be one of " + decisions.join(", ") + "." };
-  const option = (approval.decision_options ?? []).find((item) => item.kind === decision);
+  const option = decisionOptions(approval).find((item) => item.kind === decision);
   if (!option)
     return {
       error:
         "Muse does not offer " +
         decision +
         " here. Its options: " +
-        (approval.decision_options ?? []).map((item) => item.kind).join(", ") +
+        decisionOptions(approval)
+          .map((item) => item.kind)
+          .join(", ") +
         ".",
     };
   const allowing = decision.startsWith("allow");

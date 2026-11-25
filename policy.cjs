@@ -291,6 +291,9 @@ function directoryRegistration(current) {
 	const revision = current.directory_revision || current.revision;
 	return revision ? { revision } : { error: "Muse directory revision unavailable" };
 }
+function decisionOptions(approval) {
+	return (approval.decision_options ?? []).map((option) => typeof option === "string" ? { kind: option } : option);
+}
 const moneyWords = /purchase|checkout|payment|wallet|order|refund|transfer|subscription/i;
 function assistantName(text) {
 	return (text ?? "").replaceAll("{assistant}", "Muse");
@@ -308,6 +311,7 @@ function previewLines(blocks) {
 function approvalChat(approval) {
 	const scope = approval.scope ?? {};
 	for (const value of [
+		approval.runtime_request_trace?.thread_id,
 		approval.session_id,
 		scope.session_id,
 		scope.thread_id,
@@ -319,9 +323,14 @@ function approvalChat(approval) {
 function approvalNeedsLeon(approval) {
 	const display = approval.display ?? {};
 	const question = display.permission_question?.kind ?? "";
-	if (moneyWords.test(approval.approval_type ?? "") || moneyWords.test(question)) return "it spends or moves money";
-	for (const key of Object.keys(approval)) if (/checkout|payment/i.test(key) && approval[key]) return "it spends or moves money";
-	if (!display.card_title && !display.permission_question?.text) return "it does not say what it allows";
+	if ([
+		approval.approval_type,
+		question,
+		approval.method,
+		approval.policy_subject
+	].some((text) => moneyWords.test(text ?? ""))) return "it spends or moves money";
+	for (const key of Object.keys(approval)) if (/checkout|payment/i.test(key) && approval[key] && typeof approval[key] === "object") return "it spends or moves money";
+	if (!display.card_title && !display.permission_question?.text && !approval.reason) return "it does not say what it allows";
 }
 function approvalSummary(approval) {
 	const display = approval.display ?? {};
@@ -330,19 +339,19 @@ function approvalSummary(approval) {
 	return {
 		approval: approval.approval_id,
 		side_chat_id: approvalChat(approval),
-		asks: assistantName(display.card_title || display.permission_question?.text),
-		kind: display.permission_question?.kind ?? approval.approval_type ?? approval.payload?.type,
-		summary: assistantName(display.scope_summary || display.summary_title),
-		purpose: display.purpose_summary || display.reason,
+		asks: assistantName(display.card_title || display.permission_question?.text || approval.reason),
+		kind: display.permission_question?.kind ?? approval.approval_type ?? approval.method ?? approval.payload?.type,
+		summary: assistantName(display.scope_summary || display.summary_title || approval.short_explanation),
+		purpose: display.purpose_summary || display.reason || approval.action_label,
 		details: previewLines(display.request_preview_document?.blocks),
 		target: connector ? [
 			display.display_name,
 			connector.host,
 			connector.method
-		].filter(Boolean).join(" · ") : display.display_name,
-		options: (approval.decision_options ?? []).map((option) => ({
+		].filter(Boolean).join(" · ") : [display.display_name ?? approval.display_name, approval.path].filter(Boolean).join(" · "),
+		options: decisionOptions(approval).map((option) => ({
 			decision: option.kind,
-			label: option.label_text,
+			...option.label_text ? { label: option.label_text } : {},
 			...option.label?.scope ? { scope: option.label.scope } : {}
 		})),
 		requested: approval.requested_at_ms ? new Date(approval.requested_at_ms).toISOString() : void 0,
@@ -380,8 +389,8 @@ function approvalDecide(response, id, decision, leonConfirmed) {
 	const approval = pendingApprovals(response).find((item) => item.approval_id === id);
 	if (!approval) return { error: "No pending approval has that ID. Call muse_approvals for the current ones." };
 	if (!decisions.includes(decision)) return { error: "decision must be one of " + decisions.join(", ") + "." };
-	const option = (approval.decision_options ?? []).find((item) => item.kind === decision);
-	if (!option) return { error: "Muse does not offer " + decision + " here. Its options: " + (approval.decision_options ?? []).map((item) => item.kind).join(", ") + "." };
+	const option = decisionOptions(approval).find((item) => item.kind === decision);
+	if (!option) return { error: "Muse does not offer " + decision + " here. Its options: " + decisionOptions(approval).map((item) => item.kind).join(", ") + "." };
 	const reason = decision.startsWith("allow") ? approvalNeedsLeon(approval) : void 0;
 	const standing = decision.endsWith("_always") ? "it changes what Muse may do from now on" : void 0;
 	if ((reason || standing) && !leonConfirmed) return { error: "Leon decides this one (" + (reason ?? standing) + "). Tell him exactly what Muse asks, mention him, and send it with leon_confirmed only after he says yes in this conversation." };

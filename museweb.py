@@ -32,6 +32,7 @@ TOKEN_SECONDS = 600
 # muse.ai extends the login for 30 days whenever /api/session is read.
 RENEW_SECONDS = 6 * 3600
 MAX_BODY = 32 * 1024 * 1024
+RECONNECT_SECONDS = 10
 NOISE_MAX = 65535
 ROUTES = {route["method"]: route for route in json.loads(
     (Path(__file__).with_name("muse-routes.json")).read_text())}
@@ -301,8 +302,10 @@ def parse_cookies(text):
     text = text.strip()
     if text.startswith(("{", "[")):
         data = json.loads(text)
-        if isinstance(data, dict) and isinstance(data.get("cookies"), (dict, list)):
-            data = data["cookies"]
+        # agent-browser wraps its list as {"data": {"cookies": […]}}.
+        for key in ("data", "cookies"):
+            if isinstance(data, dict) and isinstance(data.get(key), (dict, list)):
+                data = data[key]
         if isinstance(data, dict):
             return {str(name): (str(value), None) for name, value in data.items()}
         issued = {}
@@ -472,8 +475,9 @@ class PlainTransport:
     def socket(self, url):
         from websockets.sync.client import connect
 
+        # Entered by hand: the connection outlives this call and is closed by the channel.
         return _PlainSocket(connect(url, origin=SITE, user_agent_header=USER_AGENT, open_timeout=20,
-                                    max_size=None, proxy=None))
+                                    max_size=None, proxy=None).__enter__())
 
 
 class _PlainSocket:
@@ -566,18 +570,24 @@ class MuseWeb:
             raise MuseWebError(f"muse.ai answered {path} with something other than JSON") from None
 
     def renew(self):
-        """Read the session, which extends the login, and wake the Muse computer if it sleeps."""
-        for attempt in range(12):
+        """Read the session, which extends the login, and return the Muse computer's ID."""
+        for _ in range(6):
             session = self._site("GET", "/api/session")
             computer = session.get("vm_id")
-            if computer and session.get("vm_state", "RUNNING") == "RUNNING":
+            if computer:
                 self.login.update({}, renewed=int(time.time()), computer=computer, refusals=0)
                 return computer
-            if computer and attempt == 0:
-                self._site("POST", "/api/hatch/vm/wake", {
-                    "vm_id": computer, "retry_count": 0, "connect_attempt_id": str(uuid.uuid4())})
+            # muse.ai answers "unavailable" for a moment while the computer restarts.
             time.sleep(5)
-        raise MuseWebError(f"the Muse computer is not available ({session.get('status')!r})")
+        raise MuseWebError(f"muse.ai has no Muse computer for this login ({session.get('status')!r})")
+
+    def wake(self, computer):
+        """Ask muse.ai to start a sleeping Muse computer."""
+        try:
+            self._site("POST", "/api/hatch/vm/wake", {
+                "vm_id": computer, "retry_count": 0, "connect_attempt_id": str(uuid.uuid4())})
+        except MuseApiError as exc:
+            LOG.info("hermes22muse: muse.ai did not wake the Muse computer (%s)", exc.status)
 
     def _connect(self):
         if self.tokens is None or time.time() - self.tokens[2] > TOKEN_SECONDS:
@@ -593,16 +603,25 @@ class MuseWeb:
         return Channel(self.transport.socket(f"{GATEWAY}?vm_id={computer}&auth_token={quote(token, safe='')}"))
 
     def channel(self):
-        """An open channel; tokens and the computer's address are fetched again if the first try fails."""
+        """An open channel. After a failure the login is read again, the computer is woken, and
+        fresh tokens are tried for about a minute."""
         try:
             return self._connect()
         except MuseLoginRequired:
             raise
         except Exception as exc:
             LOG.info("hermes22muse: reconnecting to Muse's gateway (%s)", type(exc).__name__)
+        self.wake(self.renew())
+        for attempt in range(6):
             self.tokens = None
-            self.renew()
-            return self._connect()
+            try:
+                return self._connect()
+            except MuseLoginRequired:
+                raise
+            except Exception:
+                if attempt == 5:
+                    raise
+                time.sleep(RECONNECT_SECONDS)
 
     def call(self, method, params=None, timeout=None, listen=None):
         """Call one method. Returns {status, type, body}: body is parsed JSON, text, or bytes."""
@@ -661,9 +680,15 @@ def result(status, headers, data):
         if kind.startswith("text/"):
             return {"status": status, "type": kind, "body": text}
         try:
-            return {"status": status, "type": "application/json", "body": json.loads(text) if text else None}
+            body = json.loads(text) if text else None
         except ValueError:
             return {"status": status, "type": "text/plain", "body": text}
+        # Most methods wrap their answer as {"ok": true, "result": …}.
+        if isinstance(body, dict) and isinstance(body.get("ok"), bool) and ("result" in body or not body["ok"]):
+            if not body["ok"]:
+                raise MuseApiError(status, json.dumps(body.get("error", body))[:2000])
+            body = body["result"]
+        return {"status": status, "type": "application/json", "body": body}
     return {"status": status, "type": kind, "body": data}
 
 

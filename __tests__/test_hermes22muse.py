@@ -588,6 +588,16 @@ PENDING = {"pending_approvals": [
      "display": {"card_title": "Approve this purchase"}},
     {"approval_id": "ap-3", "status": "allowed", "decision_options": [{"kind": "allow_once"}]},
 ]}
+# A request as the Muse computer sent it on 2026-11-25, without its tokens and traces.
+LIVE = {"emitted_at_ms": 1795575913737, "schema_version": 1, "recent": [], "pending": [{
+    "approval_id": "browser-consent-aacaed", "status": "pending", "decision_options": ["allow_once", "deny"],
+    "action_label": "Fill saved credentials", "display_name": "Browser", "host": "browser",
+    "method": "page.credential_fill", "path": "/page.credential_fill?target=https://apple.com",
+    "policy_subject": "connector.browser.page.credential_fill", "message_revision": 0, "payment_revision": 0,
+    "reason": "Allow Muse to fill saved credentials in Browser for \"https://apple.com\"?",
+    "short_explanation": "Muse wants to fill saved credentials.",
+    "requested_at_ms": 1795574423543, "request_expires_at_ms": 1795585223543,
+    "runtime_request_trace": {"thread_id": JOB, "device_id": "homelink-42967a"}}]}
 
 
 class MuseWebTests(unittest.TestCase):
@@ -629,6 +639,7 @@ class MuseWebTests(unittest.TestCase):
         self.gateway.reject_token = True
         self.assertEqual(self.web.call("goals.list")["body"], {"goals": []})
         self.assertEqual([path for _, path, _, _ in self.gateway.site].count("/api/hatch/token"), 2)
+        self.assertIn("/api/hatch/vm/wake", [path for _, path, _, _ in self.gateway.site])
 
     def test_an_ended_login_is_reported_and_remembered(self):
         self.gateway.login = "revoked elsewhere"
@@ -666,6 +677,8 @@ class MuseWebTests(unittest.TestCase):
             {"name": "hatch_sess", "value": "abc", "domain": ".muse.ai", "expires": 1900000000.5},
             {"name": "other", "value": "x", "domain": "gadgets.muse.ai", "expires": -1}])
         self.assertEqual(museweb.parse_cookies(exported), {"hatch_sess": ("abc", 1900000000.5)})
+        wrapped = json.dumps({"success": True, "data": {"cookies": json.loads(exported)}})
+        self.assertEqual(museweb.parse_cookies(wrapped), {"hatch_sess": ("abc", 1900000000.5)})
         self.assertEqual(museweb.parse_cookies("Cookie: a=1; hatch_sess=b=c"), {"a": ("1", None), "hatch_sess": ("b=c", None)})
 
     def test_the_method_table_is_read_from_the_apps_page(self):
@@ -693,6 +706,19 @@ class MuseAppPolicyTests(unittest.TestCase):
         self.assertNotIn("leon_decides", approval)
         everything = self.policy("approvalList", PENDING, None)["approvals"]
         self.assertEqual(everything[1]["leon_decides"], "it spends or moves money")
+
+    def test_a_request_from_the_real_muse_computer_is_read_and_answered(self):
+        self.assertEqual(self.policy("approvalList", LIVE, "another-chat")["approvals"], [])
+        [approval] = self.policy("approvalList", LIVE, JOB)["approvals"]
+        self.assertEqual(approval["asks"], 'Allow Muse to fill saved credentials in Browser for "https://apple.com"?')
+        self.assertEqual((approval["side_chat_id"], approval["kind"]), (JOB, "page.credential_fill"))
+        self.assertEqual(approval["target"], "Browser · /page.credential_fill?target=https://apple.com")
+        self.assertEqual(approval["options"], [{"decision": "allow_once"}, {"decision": "deny"}])
+        self.assertNotIn("leon_decides", approval)
+        self.assertEqual(self.policy("approvalDecide", LIVE, "browser-consent-aacaed", "allow_once", False)["params"], {
+            "approval_id": "browser-consent-aacaed", "decision": "allow_once", "expected_message_revision": 0})
+        self.assertIn("does not offer", self.policy(
+            "approvalDecide", LIVE, "browser-consent-aacaed", "allow_always", True)["error"])
 
     def test_hermes_allows_what_was_asked_and_leaves_money_and_standing_choices_to_leon(self):
         allow = self.policy("approvalDecide", PENDING, "ap-1", "allow_once", False)
@@ -732,7 +758,10 @@ class MuseAppToolTests(ToolTests):
         self.gateway.answers[("GET", "/approvals")] = (200, "application/json", json.dumps(PENDING).encode())
         self.gateway.answers[("POST", "/approvals/ap-1/decide")] = (
             200, "application/json", b'{"approval": {"approval_id": "ap-1", "status": "allowed"}}')
-        self.gateway.answers[("GET", "/tasks")] = (200, "application/json", b'{"schedules": []}')
+        self.gateway.answers[("GET", "/tasks")] = (
+            200, "application/json", b'{"ok": true, "result": {"schedules": []}}')
+        self.gateway.answers[("GET", "/skills")] = (
+            200, "application/json", b'{"ok": false, "error": {"code": "not_ready"}}')
         self.gateway.answers[("GET", "/media/raw/workspace/a.png")] = (200, "image/png", b"\x89PNG")
 
         def signed_in(directory):
@@ -771,6 +800,7 @@ class MuseAppToolTests(ToolTests):
         self.assertIn("Ask Leon first", self.call("muse_app", method="bootstrap.reset")["error"])
         self.assertIn("no method", self.call("muse_app", method="tasks.explode")["error"])
         self.assertEqual(self.call("muse_app", method="goals.list")["error"], "Muse refused it (404).")
+        self.assertIn("not_ready", self.call("muse_app", method="skills.list")["muse_says"])
         self.assertEqual(self.call("muse_app_methods", query="approval history")["methods"][0]["method"],
                          "egress.approval.history")
         saved = self.call("muse_file", path="sandbox://workspace/a.png")
