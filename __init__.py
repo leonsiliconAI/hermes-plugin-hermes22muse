@@ -174,6 +174,7 @@ PROGRESS_SCHEMA = {
     "name": "slack_task_progress",
     "description": (
         "Read the latest Hermes answer and the Grok Bot, Muse and Codex updates for this Slack task. "
+        "With plan, show Leon at the top of Task progress what you will do for this task. "
         "With summary, replace the current status with checked milestones, blockers and next steps. "
         "Give your final response normally so Hermes can save it to Task progress."
     ),
@@ -182,6 +183,9 @@ PROGRESS_SCHEMA = {
         "properties": {
             "thread_ts": {"type": "string", "description": "Exact root timestamp in this Slack channel. "
                                                           "Defaults to the current thread."},
+            "plan": {"type": "string", "maxLength": 600,
+                     "description": "One to three sentences to Leon on what you will do. Set it before starting "
+                                    "a new task, and again if Leon changes the task."},
             "summary": {"type": "string", "maxLength": 1200, "description": "Your reviewed progress summary."},
         },
         "additionalProperties": False,
@@ -411,6 +415,14 @@ def register(ctx):
             return json.dumps({"error": "Use the exact Slack root timestamp."})
         route = (team, channel, root)
         entry = progress.read(route)
+        plan = args.get("plan")
+        if plan is not None:
+            if not isinstance(plan, str) or not plan.strip() or len(plan) > 600:
+                return json.dumps({"error": "Use a plan between 1 and 600 characters."})
+            if root != current_root and entry is None:
+                return json.dumps({"error": "That collaboration thread is unknown in this channel."})
+            progress.set_plan(route, plan.strip())
+            entry = progress.read(route)
         summary = args.get("summary")
         if summary is not None:
             if not isinstance(summary, str) or not summary.strip() or len(summary) > 1200:
@@ -421,8 +433,8 @@ def register(ctx):
             entry = progress.read(route)
         if entry is None:
             return json.dumps({"thread_ts": root, "recent_tasks": progress.recent(team, channel)})
-        return json.dumps({"thread_ts": root, "progress_ts": entry["card"], "summary": entry["summary"],
-                           "latest_answer": entry["answer"],
+        return json.dumps({"thread_ts": root, "progress_ts": entry["card"], "plan": entry["plan"],
+                           "summary": entry["summary"], "latest_answer": entry["answer"],
                            "reports": entry["reports"], "queued": entry["published"] < entry["version"]})
 
     def guide(**kwargs):
@@ -435,7 +447,35 @@ def register(ctx):
         if current is None:
             return None
         job = relay.store.find(current["scope_id"], current["chat_id"], thread=current["thread_id"]) if current["thread_id"] else None
-        return call(__file__, "guideForTurn", current, owner, dict(job) if job else None)
+        return call(__file__, "guideForTurn", current, owner, dict(job) if job else None, needs_plan(current))
+
+    def needs_plan(current):
+        thread = current.get("thread_id")
+        return bool(relay is not None and thread and relay.store.progress.needs_plan(
+            (current["scope_id"], current["chat_id"], thread), current["message_id"]))
+
+    reminded = set()
+
+    def plan_first(tool_name="", **_):
+        """Turn away the first other tool of a new task until Task progress says what Hermes will do.
+
+        Hermes blocks every tool when this hook raises or hangs, so it stays in Python and SQLite and
+        catches everything. The card's row already shows that Leon's own message opened it."""
+        if relay is None or tool_name == PROGRESS_SCHEMA["name"]:
+            return None
+        try:
+            current = session()
+            if current.get("platform") != "slack" or current.get("user_id") != owner or not needs_plan(current):
+                return None
+            route = (current["scope_id"], current["chat_id"], current["thread_id"])
+            # Ask once: Hermes keeps working even if it doesn't set a plan.
+            if route in reminded:
+                return None
+            reminded.add(route)
+            return {"action": "block", "message": call(__file__, "planFirst")}
+        except Exception:
+            LOG.debug("hermes22muse: plan check skipped", exc_info=True)
+            return None
 
     def observe_slack(event, **_):
         if relay is None:
@@ -507,7 +547,7 @@ def register(ctx):
                     return turn
                 try:
                     root = await current.store.progress.open_thread(
-                        current.slack, source.scope_id, source.chat_id,
+                        current.slack, source.scope_id, source.chat_id, source.message_id,
                     )
                 except Exception:
                     LOG.exception("Could not open Slack task progress in %s", source.chat_id)
@@ -559,4 +599,5 @@ def register(ctx):
                           emoji=emoji)
     ctx.register_platform_handler("slack", wire)
     ctx.register_hook("pre_llm_call", guide)
+    ctx.register_hook("pre_tool_call", plan_first)
     ctx.register_hook("pre_gateway_dispatch", observe_slack)

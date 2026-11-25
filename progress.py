@@ -30,10 +30,16 @@ class Progress:
                     PRIMARY KEY(team, channel, root, agent)
                 );
             """)
-            if not any(row["name"] == "answer" for row in db.execute("PRAGMA table_info(progress)")):
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(progress)")}
+            if "answer" not in columns:
                 db.execute("ALTER TABLE progress ADD COLUMN answer TEXT NOT NULL DEFAULT ''")
+            if "plan" not in columns:
+                db.execute("ALTER TABLE progress ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
+            if "request" not in columns:
+                # Leon's message that opened the card: the turn that owes him a plan.
+                db.execute("ALTER TABLE progress ADD COLUMN request TEXT")
 
-    async def open_thread(self, slack, team, channel):
+    async def open_thread(self, slack, team, channel, request=None):
         """Return the issue's thread, posting the top-level progress message on first use."""
         async with self._opening.setdefault((team, channel), asyncio.Lock()):
             with self.connection() as db:
@@ -45,11 +51,22 @@ class Progress:
             if existing is not None:
                 return existing["root"]
             ts = await self._publish(slack, dict(team=team, channel=channel, root=None,
-                                                card=None, summary="", reports=[], answer=""))
+                                                card=None, summary="", reports=[], answer="", plan=""))
             with self.connection() as db:
-                db.execute("INSERT INTO progress(team, channel, root, card) VALUES (?, ?, ?, ?)",
-                           (team, channel, ts, ts))
+                db.execute("INSERT INTO progress(team, channel, root, card, request) VALUES (?, ?, ?, ?, ?)",
+                           (team, channel, ts, ts, request))
             return ts
+
+    def needs_plan(self, route, request):
+        """Whether ``request`` opened this card and Hermes hasn't said yet what it will do."""
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM progress WHERE team=? AND channel=? AND root=? AND card=root "
+                              "AND request=? AND plan=''", (*route, request)).fetchone() is not None
+
+    def set_plan(self, route, plan):
+        with self.connection() as db:
+            self._changed(db, route)
+            db.execute("UPDATE progress SET plan=? WHERE team=? AND channel=? AND root=?", (plan, *route))
 
     def is_thread(self, team, channel, root):
         with self.connection() as db:
@@ -144,7 +161,7 @@ class Progress:
         client = slack.client(entry)
         thread_link = root if root != entry["card"] else None
         text = call(__file__, "progressMessage", channel, thread_link, entry["summary"], entry["reports"],
-                    entry["answer"])
+                    entry["answer"], entry["plan"])
         args = dict(channel=channel, text=text, link_names=False)
         if entry["card"]:
             response = await asyncio.wait_for(client.chat_update(ts=entry["card"], **args), 15)

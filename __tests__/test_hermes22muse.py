@@ -574,6 +574,62 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.call("slack_task_progress")["latest_answer"],
                          "Verified the result.\n\n@Autolinear move done")
 
+    async def test_a_new_task_shows_hermes_plan_before_any_work(self):
+        root = (await self.build_turn()).source.thread_id
+        route = (TEAM, CHANNEL, root)
+        check = self.hooks["pre_tool_call"]
+        publisher = Slack(self.adapter, BOT_TOKEN)
+
+        # Leon's follow-up in the thread doesn't owe a plan; only the request that opened the card does.
+        self.session.update(thread_id=root, message_id=LATER)
+        self.assertNotIn("[Task progress]", self.hooks["pre_llm_call"](platform="slack")["context"])
+        self.assertIsNone(check(tool_name="terminal", args={}))
+
+        self.session.update(message_id=REQUEST)
+        guide = self.hooks["pre_llm_call"](platform="slack")["context"]
+        self.assertTrue(guide.startswith("[Task progress]"))
+        self.assertIn("Before any other tool, call slack_task_progress with plan", guide)
+        self.assertIsNone(check(tool_name="slack_task_progress", args={}))
+        blocked = check(tool_name="terminal", args={"command": "gcal list"})
+        self.assertEqual(blocked["action"], "block")
+        self.assertIn("Call slack_task_progress with plan", blocked["message"])
+        # Asked once: Hermes can go on working without a plan.
+        self.assertIsNone(check(tool_name="terminal", args={"command": "gcal list"}))
+
+        self.assertIn("error", self.call("slack_task_progress", plan="  "))
+        result = self.call("slack_task_progress", plan="I'll find the Thursday Game Night series on your "
+                                                         "calendar and delete every occurrence.\n\n<!channel>")
+        self.assertTrue(result["queued"])
+        self.assertTrue(result["plan"].startswith("I'll find"))
+        await self.store.progress.flush(publisher)
+        update = self.client.chat_update.await_args.kwargs
+        self.assertEqual(update["ts"], root)
+        self.assertEqual(update["text"], "*Task progress*\n\n*Plan from Hermes*\nI'll find the Thursday Game "
+                                         "Night series on your calendar and delete every occurrence.\n&lt;!channel&gt;")
+        self.assertNotIn("[Task progress]", self.hooks["pre_llm_call"](platform="slack")["context"])
+
+        # The outcome joins the plan; slack22linear still reads only the answer after its heading.
+        self.store.progress.finish(route, "Removed all 12 events.\n\n@Autolinear move done")
+        await self.store.progress.flush(publisher)
+        text = self.client.chat_update.await_args.kwargs["text"]
+        self.assertIn("*Plan from Hermes*\nI'll find", text)
+        heading = "\n\n*Update from Hermes*\n"
+        self.assertEqual(text.count(heading), 1)
+        self.assertEqual(text[text.index(heading) + len(heading):],
+                         "Removed all 12 events.\n\n@Autolinear move done")
+
+    async def test_cards_from_before_plans_keep_working(self):
+        with self.store.connection() as db:
+            db.execute("DROP TABLE progress")
+            db.execute("CREATE TABLE progress (team TEXT, channel TEXT, root TEXT, version INTEGER NOT NULL "
+                       "DEFAULT 0, published INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0, card TEXT, "
+                       "summary TEXT NOT NULL DEFAULT '', PRIMARY KEY(team, channel, root))")
+            db.execute("INSERT INTO progress(team, channel, root, card) VALUES (?, ?, ?, ?)",
+                       (TEAM, CHANNEL, REQUEST, REQUEST))
+        progress = Store(self.store.directory).progress
+        self.assertFalse(progress.needs_plan((TEAM, CHANNEL, REQUEST), REQUEST))
+        self.assertEqual(progress.read((TEAM, CHANNEL, REQUEST))["plan"], "")
+
     async def test_keeps_existing_slack_threads_and_retries_a_failed_open(self):
         self.assertIsNone((await self.build_turn(name="general")).source.thread_id)
         self.assertEqual((await self.build_turn(LATER, thread_ts=REQUEST)).source.thread_id, REQUEST)
@@ -626,6 +682,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
                 self.session.update(change)
                 self.assertIn("error", self.call("muse_handoff", task="Do it"))
                 self.assertIsNone(self.hooks["pre_llm_call"](platform=self.session["platform"]))
+                self.assertIsNone(self.hooks["pre_tool_call"](tool_name="terminal", args={}))
                 self.session = saved
         self.assertIn("error", self.call("muse_handoff", task="  "))
         self.assertIn("error", self.call("muse_reply", text="hi", handoff="unknown"))

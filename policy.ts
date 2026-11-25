@@ -149,10 +149,13 @@ export function progressMessage(
   summary: string,
   reports: { agent: string; text: string; ts: string }[],
   answer: string,
+  plan = "",
 ) {
   const lines = ["*Task progress*"];
   if (threadLink)
     lines[0] += " · <" + slackPermalink(channel, threadLink) + "|Collaboration thread>";
+  // No blank lines: slack22linear finds Hermes's answer by the blank line before its heading.
+  if (plan) lines.push("\n*Plan from Hermes*\n" + escapeSlack(plan.replace(/\n\s*\n/g, "\n")));
   if (summary) {
     const quoted = summary.split(/\r?\n/).map((line) => "> " + escapeSlack(line));
     lines.push("\n" + quoted.join("\n"));
@@ -360,13 +363,34 @@ export function startsTaskThread(
   );
 }
 
-export function guideForTurn(current: SlackTurn, owner: string, existing?: Handoff) {
-  return {
-    context:
-      existing && existing.request !== current.message_id
-        ? [handoffGuide(owner), threadGuide(existing.id)].join("\n\n")
-        : handoffGuide(owner),
-  };
+/** Shown on Leon's request that opened a Task progress message, which is empty until Hermes says what it will do. */
+export function planGuide() {
+  return (
+    "[Task progress] This request opened the issue's Task progress message, which Leon sees with nothing on it yet. " +
+    "Before any other tool, call slack_task_progress with plan: one to three sentences to Leon saying what you will do, " +
+    "the way you would open a reply to him (for example: I'll find the recurring event on your calendar, delete every " +
+    "occurrence, and check that none are left). Then do the work and give the outcome in your final response as usual."
+  );
+}
+
+/** The tool result when Hermes starts work on a new task without saying what it will do. */
+export function planFirst() {
+  return (
+    "Not run yet: Task progress doesn't say what you'll do. Call slack_task_progress with plan (one to three " +
+    "sentences to Leon on what you will do for this request), then call this tool again."
+  );
+}
+
+export function guideForTurn(
+  current: SlackTurn,
+  owner: string,
+  existing?: Handoff,
+  needsPlan = false,
+) {
+  const guides = [handoffGuide(owner)];
+  if (existing && existing.request !== current.message_id) guides.push(threadGuide(existing.id));
+  if (needsPlan) guides.unshift(planGuide());
+  return { context: guides.join("\n\n") };
 }
 
 export function answerRows(
