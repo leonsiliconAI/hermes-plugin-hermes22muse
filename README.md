@@ -33,9 +33,9 @@ Watching or steering Muse's live browser is the one part of the app the tools le
 
 ## Approvals
 
-When Muse needs the user's approval in a side chat, Hermes answers it the way the user would. While a tool waits, the relay counts the side chat's pending approvals: after about 20 seconds of work, every 30 seconds after that, and once more before an answer is returned. A pending approval makes the tool return `waiting_for_approval` with the requests themselves. Hermes applies the user's approval rule: it calls `muse_approve` with `allow_once` when the action is what the user asked for, and otherwise denies it or asks the user with a mention.
+When Muse needs the user's approval in a side chat, Hermes answers it the way the user would. While a tool waits, the relay counts only that side chat's pending approvals: after about 20 seconds of work, every 30 seconds after that, and once more before an answer is returned. Pending approvals in other side chats, the main chat, scheduled tasks or spaces are ignored so they never block a handoff. A pending approval makes the tool return `waiting_for_approval` with the requests themselves. Hermes applies the user's approval rule: it calls `muse_approve` with `allow_once` when the action is what the user asked for, and otherwise denies it or asks the user with a mention.
 
-Without a saved muse.ai login, the relay counts approvals through muse-mcp's `muse_chat_status` and Hermes answers them through Beeper's Muse bridge (`!muse approval-allow <code>`), which needs Hermes's Beeper inbox.
+Without a saved muse.ai login, the relay counts approvals through muse-mcp's `muse_chat_status` (requiring this chat's own live status to show approval waiting when an unpatched server reports an account-wide snapshot count) and Hermes answers them through Beeper's Muse bridge (`!muse approval-allow <code>`), which needs Hermes's Beeper inbox.
 
 ## Sign Hermes in to muse.ai
 

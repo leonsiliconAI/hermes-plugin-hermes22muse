@@ -88,8 +88,7 @@ class MuseChat:
         result = await self.call(
             "muse_chat_status", chat=chat_id, history_limit=1, snapshot_seconds=3, **{"from": CALLER},
         )
-        count = (result.get("live") or {}).get("pending_approval_count")
-        return count if isinstance(count, int) and not isinstance(count, bool) else None
+        return call(__file__, "mcpPendingApprovals", result)
 
     async def history(self, chat_id):
         result = await self.call(

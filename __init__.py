@@ -217,12 +217,9 @@ def register(ctx):
             return json.dumps({"error": f"Could not reach the Muse app: {exc or type(exc).__name__}"})
 
     def handoff_chat(args):
-        """The side chat to list approvals for: the named handoff's, or the current thread's."""
+        """The side chat to list approvals for: the current handoff thread's, if any."""
         if args.get("all") or relay is None:
             return None
-        if args.get("handoff"):
-            row = relay.store.handoff(str(args["handoff"]).strip())
-            return row["id"] if row is not None and row["actor"] == owner else None
         try:
             current = call(__file__, "slackTurn", session(), owner)
         except Exception:
@@ -233,9 +230,17 @@ def register(ctx):
         return row["id"] if row is not None else None
 
     def approvals_tool(args, **_):
-        chat = handoff_chat(args)
-        return app_tool(lambda muse: call(
-            __file__, "approvalList", muse.call("egress.approvals")["body"], chat))
+        def list_approvals(muse):
+            if args.get("handoff") and not args.get("all"):
+                row = relay.store.handoff(str(args["handoff"]).strip()) if relay is not None else None
+                if row is None or row["actor"] != owner:
+                    return {"error": "No handoff found. Pass the handoff ID that muse_handoff returned."}
+                chat = row["id"]
+            else:
+                chat = handoff_chat(args)
+            return call(__file__, "approvalList", muse.call("egress.approvals")["body"], chat)
+
+        return app_tool(list_approvals)
 
     def approve_tool(args, **_):
         def decide(muse):
@@ -247,6 +252,9 @@ def register(ctx):
             answer = muse.call("egress.approval.decide", plan["params"])["body"]
             LOG.info("hermes22muse: answered approval %s with %s", plan["params"]["approval_id"],
                      plan["params"]["decision"])
+            side_chat = plan["summary"].get("side_chat_id")
+            if relay is not None and side_chat:
+                relay.store.clear_approvals(side_chat)
             status = ((answer or {}).get("approval") or {}).get("status") if isinstance(answer, dict) else None
             return {"decided": plan["params"]["decision"], "status": status, "approval": plan["summary"]}
 
@@ -322,17 +330,38 @@ def register(ctx):
                 "handoffId": operation_id, "create": blocking(store.create),
                 "followUp": blocking(store.follow_up), "answer": blocking(answer),
                 "approvals": blocking(store.approvals), "wantApprovals": blocking(store.want_approvals),
+                "clearApprovals": blocking(store.clear_approvals),
                 "touch": blocking(store.touch), "now": lambda: time.monotonic(), "clock": lambda: time.time(),
                 "sleep": pause,
                 "logHandoff": lambda channel, message, job: LOG.info(
                     "hermes22muse: handed %s:%s to Muse as %s", channel, message, job),
             }
         signed_in = app().signed_in() if store else False
-        result = call(__file__, "runTool", host, name, args, session() if store else None, owner, WAIT, signed_in)
-        if result.get("status") == "waiting_for_approval" and signed_in:
+        deadline = time.monotonic() + WAIT
+        tool_name, tool_args = name, args
+        while True:
+            remaining = max(0, deadline - time.monotonic())
+            result = call(__file__, "runTool", host, tool_name, tool_args,
+                          session() if store else None, owner, remaining, signed_in)
+            if result.get("status") != "waiting_for_approval" or not signed_in:
+                return json.dumps(result)
             listed = json.loads(approvals_tool({"handoff": result["handoff"]}))
-            result["approvals"] = listed.get("approvals", listed)
-        return json.dumps(result)
+            if not isinstance(listed, dict) or "approvals" not in listed:
+                result["approvals"] = listed
+                return json.dumps(result)
+            if listed["approvals"]:
+                result["approvals"] = listed["approvals"]
+                result["approvals_pending"] = len(listed["approvals"])
+                return json.dumps(result)
+            # No pending approval belongs to this side chat (already answered, expired, or from another chat).
+            if deadline - time.monotonic() <= 0:
+                status, messages = store.answer(result["handoff"])
+                result["status"] = status
+                result["messages"] = messages
+                result.pop("approvals_pending", None)
+                result["next"] = call(__file__, "nextStep", status, signed_in)
+                return json.dumps(result)
+            tool_name, tool_args = "wait", {"handoff": result["handoff"]}
 
     def handoff_tool(args, **_):
         return run_tool("handoff", args)

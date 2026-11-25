@@ -215,15 +215,18 @@ async function runTool(host, tool, args, session, owner, seconds, app = true) {
 		const approvals = await host.approvals(job.id);
 		const decision = approvalDecision(approvals, answer.status, host.clock(), host.now() - started);
 		const status = decision === "pending" ? "waiting_for_approval" : answer.status === "answered" && decision !== "clear" ? "working" : answer.status;
-		if (decision === "pending" || decision === "clear" || host.now() >= deadline) return {
-			status,
-			handoff: job.id,
-			side_chat: sideChat(job.id),
-			slack_thread: slackPermalink(job.channel, job.root),
-			messages: answer.messages,
-			...decision === "pending" ? { approvals_pending: approvals.count } : {},
-			next: nextStep(status, app)
-		};
+		if (decision === "pending" || decision === "clear" || host.now() >= deadline) {
+			if (decision === "pending") await host.clearApprovals?.(job.id);
+			return {
+				status,
+				handoff: job.id,
+				side_chat: sideChat(job.id),
+				slack_thread: slackPermalink(job.channel, job.root),
+				messages: answer.messages,
+				...decision === "pending" ? { approvals_pending: approvals.count } : {},
+				next: nextStep(status, app)
+			};
+		}
 		if (decision === "check") await host.wantApprovals(job.id);
 		else if (polls % 3 === 0) await host.touch(job.id);
 		await host.sleep();
@@ -294,6 +297,20 @@ function directoryRegistration(current) {
 function decisionOptions(approval) {
 	return (approval.decision_options ?? []).map((option) => typeof option === "string" ? { kind: option } : option);
 }
+const approvalTaskStatuses = /* @__PURE__ */ new Set(["pending_user_confirmation", "background_pending_user_confirmation"]);
+/**
+* Pending approvals for this side chat from muse-mcp's muse_chat_status.
+* Upstream muse-mcp counts every approval in Muse's account-wide approvals.snapshot without
+* filtering by chat; unless the server marks the count scoped, a nonzero count only counts for
+* this chat when this chat's own live state also says it is waiting for approval.
+*/
+function mcpPendingApprovals(result) {
+	const live = result && typeof result === "object" ? result.live : void 0;
+	const count = live?.pending_approval_count;
+	if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return null;
+	if (count === 0 || live?.pending_approvals_scoped === true) return count;
+	return live?.agent_activity_code === "needs_approval" || typeof live?.task_status === "string" && approvalTaskStatuses.has(live.task_status) ? count : 0;
+}
 const moneyWords = /purchase|checkout|payment|wallet|order|refund|transfer|subscription/i;
 function assistantName(text) {
 	return (text ?? "").replaceAll("{assistant}", "Muse");
@@ -310,14 +327,22 @@ function previewLines(blocks) {
 /** The side chat an approval belongs to, wherever this Muse version records it. */
 function approvalChat(approval) {
 	const scope = approval.scope ?? {};
+	const scopeTrace = scope.runtime_request_trace;
 	for (const value of [
 		approval.runtime_request_trace?.thread_id,
+		approval.runtime_request_trace?.session_id,
+		scopeTrace?.thread_id,
+		scopeTrace?.session_id,
+		approval.thread_id,
 		approval.session_id,
-		scope.session_id,
 		scope.thread_id,
-		scope.session?.id,
-		scope.thread?.id
-	]) if (typeof value === "string" && value) return value;
+		scope.session_id,
+		scope.thread?.id,
+		scope.session?.id
+	]) if (typeof value === "string") {
+		const trimmed = value.trim();
+		if (trimmed) return trimmed;
+	}
 }
 /** Whether Leon has to decide: it spends money, or the request doesn't say what it is. */
 function approvalNeedsLeon(approval) {
@@ -365,16 +390,14 @@ function pendingApprovals(response) {
 	return Array.isArray(list) ? list.filter((item) => item && typeof item === "object" && (item.status ?? "pending") === "pending") : [];
 }
 /**
-* Muse's pending approvals. With a side chat, the ones that belong to it; approvals that name no
-* chat are included, since they may be that chat's.
+* Muse's pending approvals. With a side chat, only the ones that belong to that side chat:
+* approvals from other side chats, the main chat, scheduled tasks or spaces are left out so
+* they never block or bleed into this handoff.
 */
 function approvalList(response, chat) {
 	const all = pendingApprovals(response);
 	return {
-		approvals: (chat ? all.filter((approval) => {
-			const owner = approvalChat(approval);
-			return !owner || owner === chat;
-		}) : all).map(approvalSummary),
+		approvals: (chat ? all.filter((approval) => approvalChat(approval) === chat) : all).map(approvalSummary),
 		pending_in_all_chats: all.length
 	};
 }
@@ -497,6 +520,7 @@ exports.handoffGuide = handoffGuide;
 exports.handoffTexts = handoffTexts;
 exports.history = history;
 exports.loginEndedNotice = loginEndedNotice;
+exports.mcpPendingApprovals = mcpPendingApprovals;
 exports.methodGuard = methodGuard;
 exports.methodSearch = methodSearch;
 exports.museDmOpening = museDmOpening;

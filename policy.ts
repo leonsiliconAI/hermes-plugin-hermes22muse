@@ -352,6 +352,7 @@ interface ToolHost {
   answer(id: string): Promise<Answer>;
   approvals(id: string): Promise<Approvals>;
   wantApprovals(id: string): Promise<void>;
+  clearApprovals?(id: string): Promise<void>;
   touch(id: string): Promise<void>;
   logHandoff(channel: string, message: string, job: string): void;
   now(): number;
@@ -422,7 +423,8 @@ export async function runTool(
         : answer.status === "answered" && decision !== "clear"
           ? "working"
           : answer.status;
-    if (decision === "pending" || decision === "clear" || host.now() >= deadline)
+    if (decision === "pending" || decision === "clear" || host.now() >= deadline) {
+      if (decision === "pending") await host.clearApprovals?.(job.id);
       return {
         status,
         handoff: job.id,
@@ -432,6 +434,7 @@ export async function runTool(
         ...(decision === "pending" ? { approvals_pending: approvals.count } : {}),
         next: nextStep(status, app),
       };
+    }
     if (decision === "check") await host.wantApprovals(job.id);
     else if (polls % 3 === 0) await host.touch(job.id);
     await host.sleep();
@@ -574,12 +577,45 @@ function decisionOptions(approval: RawApproval): DecisionOption[] {
   );
 }
 
+interface MuseStatusLive {
+  pending_approval_count?: unknown;
+  pending_approvals_scoped?: unknown;
+  agent_activity_code?: unknown;
+  task_status?: unknown;
+}
+
+const approvalTaskStatuses = new Set([
+  "pending_user_confirmation",
+  "background_pending_user_confirmation",
+]);
+
+/**
+ * Pending approvals for this side chat from muse-mcp's muse_chat_status.
+ * Upstream muse-mcp counts every approval in Muse's account-wide approvals.snapshot without
+ * filtering by chat; unless the server marks the count scoped, a nonzero count only counts for
+ * this chat when this chat's own live state also says it is waiting for approval.
+ */
+export function mcpPendingApprovals(result: unknown): number | null {
+  const live =
+    result && typeof result === "object"
+      ? ((result as { live?: unknown }).live as MuseStatusLive | undefined)
+      : undefined;
+  const count = live?.pending_approval_count;
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return null;
+  if (count === 0 || live?.pending_approvals_scoped === true) return count;
+  const waiting =
+    live?.agent_activity_code === "needs_approval" ||
+    (typeof live?.task_status === "string" && approvalTaskStatuses.has(live.task_status));
+  return waiting ? count : 0;
+}
+
 interface RawApproval {
   approval_id?: string;
   approval_type?: string;
   status?: string;
   requested_at_ms?: number;
   request_expires_at_ms?: number;
+  thread_id?: string;
   session_id?: string;
   message_revision?: number;
   /** Muse sends the choices as names, or as objects with a label. */
@@ -592,7 +628,7 @@ interface RawApproval {
   method?: string;
   path?: string;
   policy_subject?: string;
-  runtime_request_trace?: { thread_id?: string };
+  runtime_request_trace?: { thread_id?: string; session_id?: string };
   display?: {
     display_name?: string;
     card_title?: string;
@@ -631,15 +667,26 @@ function previewLines(blocks: PreviewBlock[] | undefined) {
 /** The side chat an approval belongs to, wherever this Muse version records it. */
 function approvalChat(approval: RawApproval) {
   const scope = approval.scope ?? {};
+  const scopeTrace = scope.runtime_request_trace as
+    | { thread_id?: unknown; session_id?: unknown }
+    | undefined;
   for (const value of [
     approval.runtime_request_trace?.thread_id,
+    approval.runtime_request_trace?.session_id,
+    scopeTrace?.thread_id,
+    scopeTrace?.session_id,
+    approval.thread_id,
     approval.session_id,
-    scope.session_id,
     scope.thread_id,
-    (scope.session as { id?: unknown } | undefined)?.id,
+    scope.session_id,
     (scope.thread as { id?: unknown } | undefined)?.id,
-  ])
-    if (typeof value === "string" && value) return value;
+    (scope.session as { id?: unknown } | undefined)?.id,
+  ]) {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+  }
 }
 
 /** Whether Leon has to decide: it spends money, or the request doesn't say what it is. */
@@ -710,17 +757,13 @@ function pendingApprovals(response: unknown): RawApproval[] {
 }
 
 /**
- * Muse's pending approvals. With a side chat, the ones that belong to it; approvals that name no
- * chat are included, since they may be that chat's.
+ * Muse's pending approvals. With a side chat, only the ones that belong to that side chat:
+ * approvals from other side chats, the main chat, scheduled tasks or spaces are left out so
+ * they never block or bleed into this handoff.
  */
 export function approvalList(response: unknown, chat?: string) {
   const all = pendingApprovals(response);
-  const mine = chat
-    ? all.filter((approval) => {
-        const owner = approvalChat(approval);
-        return !owner || owner === chat;
-      })
-    : all;
+  const mine = chat ? all.filter((approval) => approvalChat(approval) === chat) : all;
   return { approvals: mine.map(approvalSummary), pending_in_all_chats: all.length };
 }
 

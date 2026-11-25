@@ -305,6 +305,59 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             "muse_chat_exists", arguments={"chat": JOB, "from": "hermes22muse"},
         )
 
+    async def test_muse_mcp_pending_approvals_ignores_other_chats_on_unpatched_server(self):
+        async def count(live):
+            result = SimpleNamespace(
+                is_error=False, structured_content={"ok": True, "live": live}, content=[],
+            )
+            session = SimpleNamespace(call_tool=AsyncMock(return_value=result))
+            return await MuseChat(session).pending_approvals(JOB)
+
+        # Unpatched muse-mcp counts Muse's account-wide approvals.snapshot; ignore when this chat isn't waiting.
+        self.assertEqual(await count({
+            "pending_approval_count": 2, "agent_activity_code": "working", "task_status": "running",
+        }), 0)
+        self.assertEqual(await count({
+            "pending_approval_count": 1, "agent_activity_code": "online", "task_status": "completed",
+        }), 0)
+        self.assertEqual(await count({
+            "pending_approval_count": 1, "agent_activity_code": "needs_approval", "task_status": "running",
+        }), 1)
+        self.assertEqual(await count({
+            "pending_approval_count": 1, "agent_activity_code": "working",
+            "task_status": "pending_user_confirmation",
+        }), 1)
+        # A server that scopes approvals.snapshot to the chat is trusted directly.
+        self.assertEqual(await count({
+            "pending_approval_count": 2, "pending_approvals_scoped": True, "agent_activity_code": "working",
+        }), 2)
+        self.assertEqual(await count({"pending_approval_count": 0}), 0)
+        self.assertIsNone(await count({"pending_approval_count": None}))
+        self.assertIsNone(await count({"pending_approval_count": True}))
+
+    async def test_relay_pending_approvals_ignores_other_chats_and_main_chat_via_muse_app(self):
+        gateway = FakeGateway()
+        mixed = {"pending": [
+            {"approval_id": "other-side", "status": "pending", "reason": "Other side chat",
+             "runtime_request_trace": {"thread_id": "other-chat"}},
+            {"approval_id": "main-chat", "status": "pending", "reason": "Main chat",
+             "scope": {"requester_source": "runtime"}},
+            {"approval_id": "cron-job", "status": "pending", "reason": "Scheduled task",
+             "scope": {"scope_type": "schedule", "schedule_id": "morning"}},
+        ]}
+        gateway.answers[("GET", "/approvals")] = (200, "application/json", json.dumps(mixed).encode())
+        web = museweb.MuseWeb(self.directory, gateway)
+        web.login.update(museweb.parse_cookies("hatch_sess=first"))
+        relay = Relay(self.store, self.slack, self.muse, OWNER, web)
+        self.create()
+        self.store.want_approvals(JOB)
+        await self.tick()
+        with self.store.connection() as db:
+            db.execute("UPDATE handoffs SET due=0")
+        self.store.want_approvals(JOB)
+        await relay.tick(self.store.due(OWNER)[0])
+        self.assertEqual(self.store.approvals(JOB)["count"], 0)
+
 
 class ToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -720,6 +773,29 @@ class MuseAppPolicyTests(unittest.TestCase):
         self.assertIn("does not offer", self.policy(
             "approvalDecide", LIVE, "browser-consent-aacaed", "allow_always", True)["error"])
 
+    def test_approvals_in_other_chats_main_chat_and_background_scopes_do_not_match_a_side_chat(self):
+        response = {"pending_approvals": [
+            {"approval_id": "main", "status": "pending", "reason": "Main chat",
+             "scope": {"requester_source": "runtime"}},
+            {"approval_id": "sched", "status": "pending", "reason": "Morning briefing",
+             "scope": {"scope_type": "schedule", "schedule_id": "morning", "thread_id": None}},
+            {"approval_id": "space", "status": "pending", "reason": "Space web read",
+             "scope": {"scope_type": "space", "space_slug": "trip"}},
+            {"approval_id": "flat-other", "status": "pending", "reason": "Flat legacy other side chat",
+             "thread_id": "other-chat"},
+            {"approval_id": "scope-trace-other", "status": "pending", "reason": "Scope trace other side chat",
+             "scope": {"runtime_request_trace": {"thread_id": "other-chat"}}},
+            {"approval_id": "this-flat", "status": "pending", "reason": "Flat legacy this side chat",
+             "thread_id": JOB},
+            {"approval_id": "this-scope-trace", "status": "pending", "reason": "Scope trace this side chat",
+             "scope": {"runtime_request_trace": {"thread_id": f" {JOB} "}}},
+        ]}
+        listed = self.policy("approvalList", response, JOB)
+        self.assertEqual(listed["pending_in_all_chats"], 7)
+        self.assertEqual([item["approval"] for item in listed["approvals"]],
+                         ["this-flat", "this-scope-trace"])
+        self.assertEqual(len(self.policy("approvalList", response, None)["approvals"]), 7)
+
     def test_hermes_allows_what_was_asked_and_leaves_money_and_standing_choices_to_leon(self):
         allow = self.policy("approvalDecide", PENDING, "ap-1", "allow_once", False)
         self.assertEqual(allow["params"], {"approval_id": "ap-1", "decision": "allow_once"})
@@ -788,6 +864,35 @@ class MuseAppToolTests(ToolTests):
         self.assertEqual([approval["approval"] for approval in result["approvals"]], ["ap-1"])
         self.assertIn("muse_approve", result["next"])
         self.assertNotIn("Beeper", result["next"])
+        # Answering or reporting clears the old count so the next muse_wait does not bounce on it.
+        self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
+
+    async def test_stale_approval_count_from_another_chat_does_not_block_muse_wait(self):
+        other_only = {"pending_approvals": [
+            {"approval_id": "ap-other", "status": "pending", "session_id": "another-chat",
+             "reason": "Other side chat"},
+        ]}
+        self.gateway.answers[("GET", "/approvals")] = (200, "application/json", json.dumps(other_only).encode())
+        self.assertEqual(self.call("muse_handoff", task="Check the paper")["status"], "not_delivered")
+        now = relay_module.time.time()
+        with self.store.connection() as db:
+            db.execute("UPDATE handoffs SET approvals=1, approvals_at=?, approvals_wanted=?", (now, now - 1))
+        result = self.call("muse_wait")
+        self.assertEqual(result["status"], "not_delivered")
+        self.assertNotIn("approvals", result)
+        self.assertNotIn("approvals_pending", result)
+
+    async def test_approvals_tool_rejects_an_unknown_handoff_id(self):
+        self.assertIn("No handoff found", self.call("muse_approvals", handoff="unknown")["error"])
+
+    async def test_approve_tool_clears_cached_approvals_for_the_handoff(self):
+        self.call("muse_handoff", task="Sign in to apple.com")
+        now = relay_module.time.time()
+        with self.store.connection() as db:
+            db.execute("UPDATE handoffs SET approvals=1, approvals_at=?, approvals_wanted=?", (now, now - 1))
+        self.assertEqual(self.call("muse_approve", approval="ap-1", decision="allow_once")["status"], "allowed")
+        self.assertIsNone(self.store.approvals(JOB)["count"])
+        self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
 
     async def test_hermes_answers_an_approval_and_works_the_app_as_leon(self):
         self.assertEqual(len(self.call("muse_approvals")["approvals"]), 2)

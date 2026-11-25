@@ -142,10 +142,21 @@ class Store:
         return {"count": row["approvals"], "checked": row["approvals_at"],
                 "wanted": row["approvals_wanted"], "changed": row["changed"]}
 
-    def measured_approvals(self, job_id, count):
+    def measured_approvals(self, job_id, count, wanted=None):
         with self.connection() as db:
-            db.execute("UPDATE handoffs SET approvals=?, approvals_at=? WHERE id=?",
-                       (count, time.time(), job_id))
+            if wanted is None:
+                db.execute("UPDATE handoffs SET approvals=?, approvals_at=? WHERE id=?",
+                           (count, time.time(), job_id))
+            else:
+                db.execute("UPDATE handoffs SET approvals=?, approvals_at=? WHERE id=? AND approvals_wanted=?",
+                           (count, time.time(), job_id, wanted))
+
+    def clear_approvals(self, job_id):
+        with self.connection() as db:
+            db.execute(
+                "UPDATE handoffs SET approvals=NULL, approvals_at=0, approvals_wanted=0, due=0 WHERE id=?",
+                (job_id,),
+            )
 
     def answer(self, job_id):
         """Muse's messages after Hermes's latest delivery once Muse has finished, else the state."""
@@ -481,7 +492,9 @@ class Relay:
                     self.store.collect(job_id, messages, full, busy)
                     wanted = self.store.approvals(job_id)
                     if wanted["wanted"] > wanted["checked"]:
-                        self.store.measured_approvals(job_id, await self.pending_approvals(muse, job_id))
+                        self.store.measured_approvals(
+                            job_id, await self.pending_approvals(muse, job_id), wanted["wanted"],
+                        )
         except Exception as exc:
             retry = max(retry or 0, self.retry(job, exc))
         self.store.schedule(job, retry=retry)
