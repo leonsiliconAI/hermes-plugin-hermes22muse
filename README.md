@@ -55,6 +55,12 @@ When Muse needs the user's approval in a side chat, Hermes answers it the way th
 
 Without a saved muse.ai login, the relay counts approvals through muse-mcp's `muse_chat_status` (requiring this chat's own live status to show approval waiting when an unpatched server reports an account-wide snapshot count) and Hermes answers them through Beeper's Muse bridge (`!muse approval-allow <code>`), which needs Hermes's Beeper inbox.
 
+## Routines
+
+Leon's routines are scheduled tasks in Muse, and each one is also a project in Linear's **Routine** status (his rule, 2026-11-25). Every ten minutes the relay reads Muse's scheduled tasks with the app's `tasks.list` and posts them, with `AUTOLINEAR_TOKEN` from the Hermes profile's environment, to autolinear's `/routines` (`HERMES22MUSE_ROUTINES_URL` overrides it). [slack22linear](../../packages/ai/leonsilicon/services/slack22linear/README.md#routine-and-watcher-projects) makes the missing projects, links them with a `Muse routine: <id>` line, and opens an Awaiting Hermes issue for a Routine project that needs Hermes. It needs Hermes's muse.ai login; without it, or without the token, nothing is sent. A failed read or post is logged as `could not send Muse's routines to Linear` and tried again ten minutes later.
+
+The routing guide tells Hermes the rest: a routine is made in Muse (through `muse_handoff`) and managed with `muse_app` (`tasks.list`, `tasks.pause`, `tasks.resume`, `tasks.delete`), and a standing watch is a project in the **Watcher** status, which [Autotrigger](../../packages/ai/leonsilicon/services/autotrigger/README.md#watchers) turns into an issue per case.
+
 ## Sign Hermes in to muse.ai
 
 The Muse app tools need the user's muse.ai login, saved once as `$HERMES_HOME/hermes22muse/muse-login.json` (mode 600). Give Hermes a login of its own: muse.ai can replace the login cookie whenever it is used and drop the old one, so a login shared with a browser signs one of them out.

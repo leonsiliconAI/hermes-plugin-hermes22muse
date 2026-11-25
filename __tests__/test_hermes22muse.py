@@ -361,6 +361,42 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.approvals(JOB)["count"], 0)
 
 
+    async def test_relay_sends_muses_routines_to_linear_with_autolinears_token(self):
+        gateway = FakeGateway()
+        schedules = {"schedules": [
+            {"id": "morning-briefing", "title": "Morning briefing", "schedule_key": "daily@08:00",
+             "mode": "task", "enabled": True, "cadence": {"kind": "daily"}},
+            {"id": "heartbeat", "title": None, "schedule_key": "interval@30m", "mode": "heartbeat",
+             "enabled": True, "is_heartbeat": True},
+        ], "invalid": []}
+        gateway.answers[("GET", "/tasks")] = (200, "application/json", json.dumps(schedules).encode())
+        web = museweb.MuseWeb(self.directory, gateway)
+        relay = Relay(self.store, self.slack, self.muse, OWNER, web)
+        sent = []
+
+        async def post(url, payload, headers):
+            sent.append((url, payload, headers))
+
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": ""}):
+            self.assertIsNone(await relay.push_routines(post))
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "secret"}):
+            self.assertIsNone(await relay.push_routines(post))  # no muse.ai login yet
+            web.login.update(museweb.parse_cookies("hatch_sess=first"))
+            self.assertEqual(await relay.push_routines(post), 2)
+        url, payload, headers = sent[0]
+        self.assertEqual(url, "https://autolinear.leonsilicon.ai/routines")
+        self.assertEqual(headers, {"Authorization": "Bearer secret"})
+        self.assertEqual([s["id"] for s in payload["schedules"]], ["morning-briefing", "heartbeat"])
+        self.assertEqual(payload["invalid"], [])
+        self.assertIsInstance(payload["at"], int)
+        self.assertEqual(len(sent), 1)
+
+        gateway.answers[("GET", "/tasks")] = (200, "application/json", b'{"nothing": []}')
+        with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "secret"}):
+            with self.assertRaises(ValueError):
+                await relay.push_routines(post)
+
+
 class ToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         temporary = TemporaryDirectory()
@@ -415,6 +451,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Handle routine work you can complete yourself", guide)
         self.assertIn("Send only the browser steps through grok_bot_send", guide)
         self.assertIn("Use Muse for research, complex work and scheduled tasks", guide)
+        self.assertIn("A watcher is a project in the Watcher status", guide)
         self.assertIn("Silicon Dot", guide)
         self.assertIn("target desktop", guide)
         result = self.call("muse_handoff", task="Summarize LEON-1 and its open questions")

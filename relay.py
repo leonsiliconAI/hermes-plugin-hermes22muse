@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import hashlib
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -19,6 +20,10 @@ MAX_WORKERS = 8
 QUIET = 8
 # How often the relay looks at Hermes's muse.ai login, which it extends every few hours.
 LOGIN_CHECK = 900
+# How often the relay sends Muse's scheduled tasks to slack22linear, through autolinear's Worker, so
+# Leon's Routine projects in Linear follow his routines in Muse (his rule, 2026-11-25).
+ROUTINES_PUSH = 600
+ROUTINES_URL = "https://autolinear.leonsilicon.ai/routines"
 # A handoff idle for a day stops polling (policy.ts pollDelay).
 SLEEP = 10 * 365 * 86400
 
@@ -458,6 +463,42 @@ class Relay:
         login.update({}, told=int(time.time()))
         LOG.warning("hermes22muse: muse.ai login ended; told the user")
 
+    async def push_routines(self, post=None):
+        """Send Muse's scheduled tasks to slack22linear, which keeps a Routine project in Linear for
+        each routine. Needs Hermes's muse.ai login and AutoLinear's token. Returns how many it sent."""
+        token = os.environ.get("AUTOLINEAR_TOKEN", "").strip()
+        if not token or self.web is None or not self.web.signed_in():
+            return None
+        answer = await asyncio.to_thread(self.web.call, "tasks.list")
+        body = answer.get("body")
+        schedules = body.get("schedules") if isinstance(body, dict) else None
+        if not isinstance(schedules, list):
+            raise ValueError("Muse's tasks.list had no schedules")
+        payload = {"at": int(time.time() * 1000), "schedules": schedules,
+                   "invalid": body.get("invalid") or []}
+        url = os.environ.get("HERMES22MUSE_ROUTINES_URL", "").strip() or ROUTINES_URL
+        if post is None:
+            import httpx
+
+            async def post(url, payload, headers):
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(url, json=payload, headers=headers)
+                    response.raise_for_status()
+
+        await post(url, payload, {"Authorization": f"Bearer {token}"})
+        return len(schedules)
+
+    async def sync_routines(self):
+        """Every ROUTINES_PUSH seconds, beside the handoffs: a slow Muse never holds them up."""
+        await asyncio.sleep(60)
+        while True:
+            try:
+                await asyncio.wait_for(self.push_routines(), 180)
+            except Exception as exc:
+                LOG.warning("hermes22muse: could not send Muse's routines to Linear (%s)",
+                            exc or type(exc).__name__)
+            await asyncio.sleep(ROUTINES_PUSH)
+
     async def send_to_muse(self, muse, job, entry):
         async def history(job_id):
             messages, _, _ = await muse.history(job_id)
@@ -550,6 +591,8 @@ class Relay:
             login_checked = 0
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(self.publish_progress())
+                if self.web is not None:
+                    tasks.create_task(self.sync_routines())
                 while True:
                     if self.web is not None and time.monotonic() - login_checked > LOGIN_CHECK:
                         login_checked = time.monotonic()
