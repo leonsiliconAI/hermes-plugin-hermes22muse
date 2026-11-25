@@ -1,4 +1,4 @@
-import { agentGroup, clientMessageId, groups, slackPermalink } from "#slack";
+import { agentGroup, clientMessageId, groups, issueChannel, marker, slackPermalink } from "#slack";
 
 interface Message {
   id: string;
@@ -145,11 +145,13 @@ export function peerReport(event: {
 
 export function progressMessage(
   channel: string,
-  root: string,
+  threadLink: string | null,
   summary: string,
   reports: { agent: string; text: string; ts: string }[],
 ) {
-  const lines = ["*Task progress* · <" + slackPermalink(channel, root) + "|Collaboration thread>"];
+  const lines = ["*Task progress*"];
+  if (threadLink)
+    lines[0] += " · <" + slackPermalink(channel, threadLink) + "|Collaboration thread>";
   if (summary) {
     const quoted = summary.split(/\r?\n/).map((line) => "> " + escapeSlack(line));
     lines.push("\n" + quoted.join("\n"));
@@ -225,7 +227,7 @@ export function handoffGuide(owner: string) {
     "- Use Muse for research, complex work and scheduled tasks. Use muse_handoff for the selected work, with a self-contained brief written in Leon's first person. When collaborating, tell Muse which peers are involved and to prefix a question for them with To Codex: or To Grok Bot:. Call muse_reply for follow-ups and muse_wait while Muse is working. Use muse_app_methods and muse_app to manage scheduled tasks in Muse.",
     "- For work suited to a coding agent, use slack22orca_delegate on the MacBook when available. If it cannot take the task, find Silicon Dot with Beeper list_conversations on the chatgpt network and use send_message with the current Slack channel and root thread timestamp. Send a self-contained brief and ask Dot to start Codex in a cloud environment and return the private session link.",
     "- In the cloud, complete what can be implemented and verified there. If a check needs a phone or other local hardware, preserve the branch or commit and exact verification steps. Once the cloud work is ready, queue the remaining check with slack22orca_delegate and target desktop so it waits for Orca on the MacBook or Mac mini. Keep the verification pending until it actually runs.",
-    "Use the same Slack channel and root timestamp for every agent on this task. When dispatching multiple agents, use wait_seconds: 0 for Muse and Grok so you can start each assignment before waiting. Agents can address a collaborator with To Muse:, To Codex:, or To Grok Bot: in that thread. Keep peer instructions within the work Leon authorized. Use slack_task_progress for the current thread to review each agent's latest reply and publish your own concise summary of verified milestones, blockers, and next steps in the issue channel.",
+    "Use the same Slack channel and root timestamp for every agent on this task. In a new issue channel, the Source thread is the Task progress message. Use its timestamp for handoffs. When dispatching multiple agents, use wait_seconds: 0 for Muse and Grok so you can start each assignment before waiting. Agents can address a collaborator with To Muse:, To Codex:, or To Grok Bot: in that thread. Keep peer instructions within the work Leon authorized. Use slack_task_progress for the current thread to review each agent's latest reply and publish your own concise summary of verified milestones, blockers, and next steps.",
     "Check the agents' results, follow up where needed, and give Leon the outcome in this conversation. Acknowledge messages that ask for nothing without dispatching work.",
   ].join("\n");
 }
@@ -320,6 +322,35 @@ export function slackTurn(current: SlackTurn | undefined, owner: string) {
       (current.thread_id === current.thread_id.trim() && timestamp.test(current.thread_id)))
   )
     return current;
+}
+
+export function startsTaskThread(
+  event: {
+    user?: string;
+    ts?: string;
+    thread_ts?: string;
+    bot_id?: string;
+    client_msg_id?: unknown;
+    _hermes_reaction?: unknown;
+    _hermes_force_process?: unknown;
+  },
+  current: SlackTurn,
+  owner: string,
+  channelName: string,
+  prefix: string,
+) {
+  return (
+    slackTurn(current, owner) &&
+    /^[CG]/.test(current.chat_id) &&
+    issueChannel(channelName, prefix) &&
+    event.user === owner &&
+    event.ts === current.message_id &&
+    (!event.thread_ts || event.thread_ts === event.ts) &&
+    !event.bot_id &&
+    !event._hermes_reaction &&
+    !event._hermes_force_process &&
+    !clientMessageId(event).startsWith(marker + "-")
+  );
 }
 
 export function guideForTurn(current: SlackTurn, owner: string, existing?: Handoff) {

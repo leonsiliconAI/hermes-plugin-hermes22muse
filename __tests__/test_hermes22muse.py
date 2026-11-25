@@ -381,6 +381,12 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, env):
             plugin.register(ctx)
         self.adapter, self.client = fake_adapter()
+        self.build = self.adapter._build_message_event = AsyncMock(side_effect=lambda event, **kw: SimpleNamespace(
+            source=SimpleNamespace(platform="slack", scope_id=TEAM, chat_id=CHANNEL, chat_name=kw["name"],
+                                   user_id=event["user"], message_id=event["ts"], thread_id=event.get("thread_ts")),
+            raw_message=event, reply_to_message_id=None,
+        ))
+        self.adapter._register_mentioned_thread = Mock()
         constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
         with patch.dict(sys.modules, {"hermes_constants": constants}):
             ctx.wire(None, self.adapter)
@@ -398,6 +404,9 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
 
     def call(self, name, **args):
         return json.loads(self.tools[name](args))
+
+    async def build_turn(self, ts=REQUEST, name="leon-1-test", **raw):
+        return await self.adapter._build_message_event({"ts": ts, "user": OWNER, **raw}, name=name)
 
     async def test_handoff_threads_under_leons_message_with_everything_sent(self):
         guide = self.hooks["pre_llm_call"](platform="slack")["context"]
@@ -441,23 +450,41 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("check_fn" not in options for options in self.tool_options.values()))
 
     async def test_peer_messages_reach_muse_once_and_hermes_updates_one_channel_message(self):
+        opening, follow_up = await asyncio.gather(self.build_turn(), self.build_turn(LATER))
+        self.client.chat_postMessage.assert_awaited_once()
+        post = self.client.chat_postMessage.await_args.kwargs
+        self.assertNotIn("thread_ts", post)
+        self.assertEqual(post["text"], "*Task progress*")
+        root = opening.source.thread_id
+        self.assertNotEqual(root, REQUEST)
+        self.assertEqual(opening.source.message_id, REQUEST)
+        self.assertEqual(opening.reply_to_message_id, root)
+        self.assertEqual(follow_up.source.thread_id, root)
+        self.assertTrue(self.adapter._hermes22muse_handoff_thread(TEAM, CHANNEL, root))
+        self.adapter._register_mentioned_thread.assert_called_with(root, TEAM)
+        self.assertEqual(await Store(self.store.directory).progress.open_thread(
+            Slack(self.adapter, BOT_TOKEN), TEAM, CHANNEL), root)
+        self.client.chat_postMessage.assert_awaited_once()
+
+        self.session.update(thread_id=root)
         self.call("muse_handoff", task="Research the plan with Codex and Grok Bot", wait_seconds=0)
-        route = (TEAM, CHANNEL, REQUEST)
+        self.assertEqual(self.store.handoff(JOB)["root"], root)
+        route = (TEAM, CHANNEL, root)
         event = SimpleNamespace(source=SimpleNamespace(
             platform="slack", scope_id=TEAM, chat_id=CHANNEL, user_id=OWNER), channel_prompt=None,
-            raw_message={"user": OWNER, "thread_ts": REQUEST, "ts": LATER,
+            raw_message={"user": OWNER, "thread_ts": root, "ts": "1795000200.000001",
                          "client_msg_id": "de1e6a7e-c0de-4000-8000-000000000001",
-                         "text": ":robot_face: *Task slack:C001/1795000000.000001*: To Muse: Which constraints apply?"})
+                         "text": f":robot_face: *Task slack:C001/{root}*: To Muse: Which constraints apply?"})
         receive = self.hooks["pre_gateway_dispatch"]
         receive(event=event)
         self.assertIn("already delivered to the Muse queue", event.channel_prompt)
         receive(event=event)
 
-        event.raw_message.update(ts="1795000003.000001", text="Browser check found requirement A.",
+        event.raw_message.update(ts="1795000200.000002", text="Browser check found requirement A.",
                                  client_msg_id="de1e6a7e-b075-4b22-8000-000000000001")
         receive(event=event)
         event.raw_message.update(text="Browser check confirmed requirement A.",
-                                 _slack_changed_event_ts="1795000004.000001")
+                                 _slack_changed_event_ts="1795000200.000003")
         self.adapter._hermes_task_report_edit(TEAM, CHANNEL, event.raw_message)
         with self.store.connection() as db:
             queued = db.execute("SELECT ts, text FROM inbound WHERE handoff=? ORDER BY rowid", (JOB,)).fetchall()
@@ -468,12 +495,13 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         progress = self.store.progress
         publisher = Slack(self.adapter, BOT_TOKEN)
         await progress.flush(publisher)
-        post = self.client.chat_postMessage.await_args.kwargs
-        self.assertNotIn("thread_ts", post)
-        self.assertIn("Task progress", post["text"])
-        self.assertIn("Browser check confirmed requirement A.", post["text"])
-        self.assertIn("Which constraints apply?", post["text"])
-        card = progress.read(route)["card"]
+        self.client.chat_postMessage.assert_awaited_once()
+        update = self.client.chat_update.await_args.kwargs
+        self.assertEqual(update["ts"], root)
+        self.assertIn("Task progress", update["text"])
+        self.assertIn("Browser check confirmed requirement A.", update["text"])
+        self.assertIn("Which constraints apply?", update["text"])
+        self.assertEqual(progress.read(route)["card"], root)
 
         # A Muse reply goes into the same Slack thread and is recorded with its Slack receipt.
         with self.store.connection() as db:
@@ -484,17 +512,42 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         })
         publisher._new_muse_client = lambda: muse_client
         await Relay(self.store, publisher, FakeMuse(), OWNER).flush_slack(self.store.handoff(JOB))
-        self.assertEqual(posts(muse_client), [(REQUEST, "To Codex: The limit is 20.")])
+        self.assertEqual(posts(muse_client), [(root, "To Codex: The limit is 20.")])
+        self.assertEqual(self.client.chat_postMessage.await_args.kwargs["thread_ts"], root)
 
         task_progress = self.call("slack_task_progress", summary="Verified requirement A. Codex is applying the limit.")
+        self.assertEqual(task_progress["thread_ts"], task_progress["progress_ts"])
         self.assertTrue(task_progress["queued"])
         self.assertEqual({item["agent"] for item in task_progress["reports"]}, {"Codex", "Grok Bot", "Muse"})
         await Store(self.store.directory).progress.flush(publisher)
         update = self.client.chat_update.await_args.kwargs
-        self.assertEqual(update["ts"], card)
+        self.assertEqual(update["ts"], root)
         self.assertIn("Verified requirement A.", update["text"])
         self.assertIn("To Codex: The limit is 20.", update["text"])
         self.assertFalse(self.call("slack_task_progress")["queued"])
+
+    async def test_keeps_existing_slack_threads_and_retries_a_failed_open(self):
+        self.assertIsNone((await self.build_turn(name="general")).source.thread_id)
+        self.assertEqual((await self.build_turn(LATER, thread_ts=REQUEST)).source.thread_id, REQUEST)
+        self.assertIsNone((await self.build_turn(user="UOTHER")).source.thread_id)
+        self.client.chat_postMessage.assert_not_awaited()
+
+        send = self.client.chat_postMessage.side_effect
+        self.client.chat_postMessage.side_effect = TimeoutError
+        self.assertIsNone((await self.build_turn()).source.thread_id)
+        self.assertEqual(self.store.progress.recent(TEAM, CHANNEL), [])
+        self.client.chat_postMessage.side_effect = send
+        self.assertIsNotNone((await self.build_turn()).source.thread_id)
+        self.assertEqual(self.client.chat_postMessage.await_args_list[0].kwargs["client_msg_id"],
+                         self.client.chat_postMessage.await_args_list[1].kwargs["client_msg_id"])
+
+    async def test_existing_issue_reuses_its_original_collaboration_thread(self):
+        route = (TEAM, CHANNEL, REQUEST)
+        self.store.progress.update(route, "Work is underway.")
+        await self.store.progress.flush(Slack(self.adapter, BOT_TOKEN))
+        self.assertIn("Collaboration thread", self.client.chat_postMessage.await_args.kwargs["text"])
+        self.assertEqual((await self.build_turn(LATER)).source.thread_id, REQUEST)
+        self.client.chat_postMessage.assert_awaited_once()
 
     async def test_ignores_unmarked_or_outside_participants(self):
         receive = self.hooks["pre_gateway_dispatch"]

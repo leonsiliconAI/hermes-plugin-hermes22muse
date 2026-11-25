@@ -27,7 +27,7 @@ HANDOFF_SCHEMA = {
     "name": "muse_handoff",
     "description": (
         "Hand research or complex work from Leon's Slack request to Muse in a new side chat, and "
-        "wait for Muse's answer. Posts a reply in a thread under Leon's message showing exactly what "
+        "wait for Muse's answer. Posts a reply in the current Slack task thread showing exactly what "
         "was sent; Muse's replies and your follow-ups appear in that thread. Muse sees nothing but "
         "`task`, so make it self-contained. Returns Muse's messages with status answered, status "
         "waiting_for_approval if Muse needs Leon's approval (the result's `next` says how to answer "
@@ -174,7 +174,8 @@ PROGRESS_SCHEMA = {
     "description": (
         "Read the latest Grok Bot, Muse and Codex updates for this Slack task. With summary, queue an "
         "edit to the task's top-level progress message with your checked milestones, blockers and next "
-        "steps. The full discussion stays in the collaboration thread. This does not move the Linear issue."
+        "steps. The Task progress message hosts the discussion for new Slack issues. "
+        "This does not move the Linear issue."
     ),
     "parameters": {
         "type": "object",
@@ -480,12 +481,44 @@ def register(ctx):
         relay = current
         adapter._hermes22muse_worker = worker
         # Older AutoLinear versions use the ownership hook to skip direct Codex dispatch.
-        # The thread hook keeps replies in their existing Muse handoff.
+        # The thread hook keeps replies in an existing collaboration thread, even without Muse.
         adapter._hermes22muse_owns_request = owns_slack_request
         adapter._hermes22muse_handoff_thread = (
-            lambda team, channel, thread: current.store.find(team or "", channel or "", thread=thread)
-            is not None)
+            lambda team, channel, thread: current.store.progress.is_thread(team, channel, thread)
+            or current.store.find(team or "", channel or "", thread=thread) is not None)
         adapter._hermes_task_report_edit = revise_peer_report
+        build = getattr(adapter, "_build_message_event", None)
+
+        if callable(build):
+            @functools.wraps(build)
+            async def build_in_task_thread(*args, **kwargs):
+                turn = await build(*args, **kwargs)
+                if turn is None or relay is not current or kwargs.get("is_command_text"):
+                    return turn
+                source = turn.source
+                incoming = {"platform": getattr(source.platform, "value", source.platform),
+                            "scope_id": source.scope_id, "chat_id": source.chat_id,
+                            "message_id": source.message_id, "user_id": source.user_id}
+                prefix = os.getenv("AUTOLINEAR_CHANNEL_PREFIX", "").strip() or "leon"
+                if not call(__file__, "startsTaskThread", turn.raw_message or {}, incoming, owner,
+                            source.chat_name or "", prefix):
+                    return turn
+                try:
+                    root = await current.store.progress.open_thread(
+                        current.slack, source.scope_id, source.chat_id,
+                    )
+                except Exception:
+                    LOG.exception("Could not open Slack task progress in %s", source.chat_id)
+                else:
+                    source.thread_id = root
+                    turn.reply_to_message_id = root
+                    register_thread = getattr(adapter, "_register_mentioned_thread", None)
+                    if callable(register_thread):
+                        register_thread(root, source.scope_id)
+                return turn
+
+            adapter._build_message_event = build_in_task_thread
+
         disconnect = adapter.disconnect
 
         @functools.wraps(disconnect)
@@ -501,6 +534,8 @@ def register(ctx):
                 del adapter._hermes22muse_owns_request
                 del adapter._hermes22muse_handoff_thread
                 del adapter._hermes_task_report_edit
+                if callable(build) and adapter._build_message_event is build_in_task_thread:
+                    adapter._build_message_event = build
                 adapter.disconnect = disconnect
                 adapter._hermes22muse_worker = None
                 await disconnect(*args, **kwargs)
