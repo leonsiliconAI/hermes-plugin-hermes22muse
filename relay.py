@@ -361,7 +361,7 @@ class Relay:
             "register": muse.ensure_registered, "exists": muse.exists,
             "history": history, "attempted": self.store.attempted,
             "accepted": self.store.accepted, "send": muse.send,
-        }, dict(job), dict(entry), operation_id(job["id"], entry["ts"]), STAMP, immediate={
+        }, dict(job), dict(entry), STAMP, immediate={
             "byteLength": lambda text: len(text.encode("utf-8")),
             "clipUtf8": lambda text, limit: text.encode("utf-8")[:int(limit)].decode("utf-8", errors="ignore"),
         })

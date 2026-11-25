@@ -154,39 +154,31 @@ export function museDmOpening(text: string, channel: string, thread: string) {
   return text + "\n\nOriginal Slack thread: " + slackPermalink(channel, thread);
 }
 
-/** What Muse receives for a new handoff, and the thread post that shows all of it. */
-export function handoffTexts(task: string, channel: string, ts: string, handoff: string) {
-  const muse =
-    "Hermes, Leon's assistant, is handing you a task from Slack (" +
-    slackPermalink(channel, ts) +
-    "). Work on it in this chat and reply here. Hermes reads your replies, may follow up, " +
-    "and passes your final answer to Leon. Leon may also join this chat.\n\nTask:\n" +
-    task;
+/**
+ * What Muse receives for a new handoff, and the thread post that shows it. Muse gets the task
+ * exactly as written, as a message from Leon, with no relay framing.
+ */
+export function handoffTexts(task: string, channel: string, _ts: string, handoff: string) {
   const slackReply = channel.startsWith("D") ? "\nMuse will send replies in its own Slack DM." : "";
   return {
-    muse,
-    thread:
-      "Handed to Muse. Side chat: " +
-      sideChat(handoff) +
-      slackReply +
-      "\nEverything sent to Muse:\n\n" +
-      muse,
+    muse: task,
+    thread: "Sent to Muse as you. Side chat: " + sideChat(handoff) + slackReply + "\n\n" + task,
   };
 }
 
 export function followUpThread(text: string) {
-  return "Hermes → Muse\n" + text;
+  return "Sent to Muse as you\n" + text;
 }
 
 export function handoffGuide(owner: string) {
   return [
     "[hermes22muse] Leon has Muse, his personal AI, do the work on his Slack requests, with you as the one who hands it over and checks the result:",
     '1. Work out what he is asking. Short messages such as "continue", "do it" or "try again" refer to earlier messages: read this conversation and, when needed, the channel\'s history, its Linear issue and the links there.',
-    "2. If you can write a clear, self-contained task, call muse_handoff with it. Muse sees only that text, so include the goal, every relevant detail (names, links, IDs, earlier decisions, constraints) and what a good answer looks like. Don't do the task yourself first.",
+    "2. If you can write a clear, self-contained task, call muse_handoff with it. Muse receives it as a message from Leon himself, so write it the way he would type it to Muse: first person, short and direct, without mentioning yourself, Hermes, Slack, a relay or that you act for him. Muse sees only that text, so include the goal, every relevant detail (names, links, IDs, earlier decisions, constraints) and what a good answer looks like. Don't do the task yourself first.",
     "3. If the request is too vague for that, don't call muse_handoff. Ask Leon one specific clarifying question and mention <@" +
       owner +
       "> so he is pinged.",
-    "4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply; the exchange stays in that thread. If Muse is still working, call muse_wait.",
+    "4. muse_handoff posts the full task in a thread under his message and returns Muse's reply. Judge it against his request. If it is incomplete, wrong or unclear, follow up with muse_reply, also written as Leon; the exchange stays in that thread. If Muse is still working, call muse_wait.",
     "5. When you are satisfied, give Leon a concise, checked answer in your normal reply. The Muse bot relays the transcript in the original channel thread or, for a DM with you, in its own DM with Leon. Keep your own reply focused on the outcome, any corrections, and what Leon needs to know.",
     "Messages that ask for nothing (thanks, ok) and Hermes commands don't go to Muse.",
   ].join("\n");
@@ -199,7 +191,8 @@ export function threadGuide(handoff: string) {
     " between you and Muse (side chat " +
     sideChat(handoff) +
     "), and Leon just wrote in it. If his message is for Muse or changes the task, pass it on with " +
-    "muse_reply, written so Muse can act on it, and judge Muse's answer before you reply to Leon. " +
+    "muse_reply, written as Leon himself would write it to Muse (first person, no mention of you or Hermes), " +
+    "and judge Muse's answer before you reply to Leon. " +
     "The Muse bot posts Muse's messages in channel threads or in its own Slack DM with Leon. Keep your own reply focused on the checked outcome and any added context."
   );
 }
@@ -207,7 +200,7 @@ export function threadGuide(handoff: string) {
 const nextSteps: Record<string, string> = {
   answered:
     "Check Muse's answer against Leon's request. If it is complete, give Leon the checked outcome in " +
-    "your usual reply. Otherwise follow up with muse_reply.",
+    "your usual reply. Otherwise follow up with muse_reply, written as Leon.",
   working: "Muse is still working. Call muse_wait to keep waiting.",
   not_delivered:
     "Muse has not received the message yet (the Muse link may be down). Call muse_wait to keep " +
@@ -399,30 +392,30 @@ export async function sendInbound(
   host: InboundHost,
   job: Handoff,
   entry: { ts: string; text: string; attempted: boolean },
-  identifier: string,
   stamp: string,
 ) {
   const first = entry.ts === job.request;
-  const prefix = "[Hermes delivery " + identifier + "]\n";
-  if (first) await host.register(job.id);
-  if (entry.attempted && (!first || (await host.exists(job.id)))) {
-    const previous = (await host.history(job.id)).find(
-      (message) => message.role === "user" && message.text.startsWith(stamp + prefix),
-    );
-    if (previous) {
-      await host.accepted(job.id, entry.ts, previous.id);
-      return;
-    }
-  }
-  await host.attempted(job.id, entry.ts);
   let text = entry.text;
-  if (host.byteLength(stamp + prefix + text) > 64 * 1024) {
+  if (host.byteLength(stamp + text) > 64 * 1024) {
     text =
       host.clipUtf8(text, 60 * 1024) +
       "\n\n[Shortened. The rest is in the Slack thread] " +
       slackPermalink(job.channel, job.root);
   }
-  await host.accepted(job.id, entry.ts, await host.send(job.id, prefix + text));
+  if (first) await host.register(job.id);
+  if (entry.attempted && (!first || (await host.exists(job.id)))) {
+    // Messages carry no marker, so a send whose receipt was lost is recognized by its text.
+    const history = await host.history(job.id);
+    for (let index = history.length - 1; index >= 0; index--) {
+      const message = history[index];
+      if (message.role === "user" && (message.text === text || message.text === stamp + text)) {
+        await host.accepted(job.id, entry.ts, message.id);
+        return;
+      }
+    }
+  }
+  await host.attempted(job.id, entry.ts);
+  await host.accepted(job.id, entry.ts, await host.send(job.id, text));
 }
 
 export function collectPlan(

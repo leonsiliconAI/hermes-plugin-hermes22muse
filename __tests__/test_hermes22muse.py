@@ -33,6 +33,8 @@ class FakeMuse:
         self.sends = []
         self.lose_receipt = False
         self.busy = False
+        # muse-mcp prefixes sends with its provenance stamp unless the server strips it.
+        self.stamp = STAMP
 
     @asynccontextmanager
     async def connect(self):
@@ -47,7 +49,7 @@ class FakeMuse:
     async def send(self, chat_id, text):
         self.sends.append((chat_id, text))
         message_id = f"muse-{len(self.sends)}"
-        self.chats.setdefault(chat_id, []).append(Message(message_id, "user", STAMP + text))
+        self.chats.setdefault(chat_id, []).append(Message(message_id, "user", self.stamp + text))
         if self.lose_receipt:
             self.lose_receipt = False
             raise TimeoutError
@@ -133,7 +135,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.relay = Relay(self.store, self.slack, self.muse, OWNER)
         self.store.follow_up(JOB, "Vegetarian, please", "Hermes → Muse\nVegetarian, please")
         await self.tick()
-        self.assertTrue(self.muse.sends[1][1].endswith("]\nVegetarian, please"))
+        self.assertEqual(self.muse.sends[1][1], "Vegetarian, please")
         self.assertEqual(self.store.answer(JOB), ("working", []), "the earlier answer no longer counts")
         self.muse.chats[JOB] += [Message("direct", "user", "No mushrooms"), Message("final", "assistant", "Lentil soup")]
         await self.tick()
@@ -164,6 +166,17 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         self.assertIsNone(self.store.next_inbound(JOB))
         self.assertEqual(len(self.muse.sends), 1)
+
+    async def test_unstamped_send_reads_as_leons_own_and_survives_a_lost_receipt(self):
+        self.muse.stamp = ""
+        self.create()
+        self.muse.lose_receipt = True
+        await self.tick()
+        await self.tick()
+        self.assertIsNone(self.store.next_inbound(JOB))
+        self.assertEqual(self.muse.sends, [(JOB, "Task:\nFind a recipe")])
+        await self.tick()
+        self.assertNotIn("You in Muse", " ".join(text for _, text in posts(self.client)))
 
     async def test_handoffs_from_1x_are_not_relayed_again(self):
         with self.store.connection() as db:
@@ -305,18 +318,20 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["side_chat"], f"https://muse.ai/thread/{JOB}")
         job = self.store.handoff(JOB)
         self.assertEqual(job["root"], REQUEST)
+        self.assertIn("first person", guide)
         sent = self.store.next_inbound(JOB)["text"]
-        self.assertTrue(sent.endswith("Task:\nSummarize LEON-1 and its open questions"))
+        self.assertEqual(sent, "Summarize LEON-1 and its open questions")
         [thread_post] = [row["text"] for row in self.store.pending_output(JOB)]
         self.assertIn(f"Side chat: https://muse.ai/thread/{JOB}", thread_post)
-        self.assertTrue(thread_post.endswith(sent))
+        self.assertTrue(thread_post.endswith("\n\n" + sent))
         self.assertIn("already belongs", self.call("muse_handoff", task="again")["error"])
 
         # Leon writes in the thread; Hermes forwards it.
         self.session.update(thread_id=REQUEST, message_id=LATER)
         self.assertIn(JOB, self.hooks["pre_llm_call"](platform="slack")["context"])
         self.assertEqual(self.call("muse_reply", text="Only the blockers")["handoff"], JOB)
-        self.assertEqual(self.store.pending_output(JOB)[-1]["text"], "Hermes → Muse\nOnly the blockers")
+        self.assertEqual(self.store.pending_output(JOB)[-1]["text"], "Sent to Muse as you\nOnly the blockers")
+        self.assertEqual(self.store.next_inbound(JOB)["text"], "Summarize LEON-1 and its open questions")
         self.assertEqual(self.call("muse_wait")["status"], "not_delivered")
 
     async def test_tools_and_guide_ignore_other_people_and_platforms(self):

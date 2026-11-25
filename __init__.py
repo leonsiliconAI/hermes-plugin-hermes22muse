@@ -32,8 +32,10 @@ HANDOFF_SCHEMA = {
         "type": "object",
         "properties": {"task": {
             "type": "string",
-            "description": "The complete task for Muse: goal, all relevant context from the "
-                           "conversation and channel, constraints, and what a good answer looks like.",
+            "description": "The complete task, sent to Muse as Leon's own message: written the way "
+                           "he would type it (first person, no mention of Hermes, Slack or a relay), "
+                           "with the goal, all relevant context from the conversation and channel, "
+                           "constraints, and what a good answer looks like.",
         }},
         "required": ["task"],
         "additionalProperties": False,
@@ -49,7 +51,8 @@ REPLY_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "text": {"type": "string", "description": "The message for Muse."},
+            "text": {"type": "string",
+                     "description": "The message for Muse, sent as Leon's own message and written as he would."},
             "handoff": {"type": "string", "description": "Handoff ID returned by muse_handoff."},
         },
         "required": ["text"],
