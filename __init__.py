@@ -168,8 +168,12 @@ def register(ctx):
         worker = asyncio.create_task(current.run())
         relay = current
         adapter._hermes22muse_worker = worker
-        # AutoLinear's plugin leaves these requests to Hermes and Muse.
+        # AutoLinear's plugin moves these requests to their issue channels without its Codex handoff,
+        # and leaves replies in a handoff's thread where they are.
         adapter._hermes22muse_owns_request = owns_slack_request
+        adapter._hermes22muse_handoff_thread = (
+            lambda team, channel, thread: current.store.find(team or "", channel or "", thread=thread)
+            is not None)
         disconnect = adapter.disconnect
 
         @functools.wraps(disconnect)
@@ -183,6 +187,7 @@ def register(ctx):
                 if relay is current:
                     relay = None
                 del adapter._hermes22muse_owns_request
+                del adapter._hermes22muse_handoff_thread
                 adapter.disconnect = disconnect
                 adapter._hermes22muse_worker = None
                 await disconnect(*args, **kwargs)

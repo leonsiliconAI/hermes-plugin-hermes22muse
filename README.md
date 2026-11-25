@@ -44,7 +44,7 @@ Set these values in the Hermes profile’s environment and install the plugin. O
 hermes plugins install leonsiliconAI/hermes-plugin-hermes22muse --enable --yes-deps
 ```
 
-If the same profile runs the AutoLinear Hermes plugin, update it to 1.4.6 or later. Its gateway intake leaves the configured user's requests to hermes22muse. If the separate AutoLinear Slack app also subscribes to that user’s messages for fast intake, pause those subscriptions before enabling this integration so the Worker does not move or edit an original request ahead of Hermes.
+If the same profile runs the AutoLinear Hermes plugin, update it to 1.5.0 or later. Each request still gets its own Linear issue and channel, and Hermes hands it to Muse there instead of AutoLinear’s Codex handoff. Replies in a handoff’s thread stay in that thread. Keep the separate AutoLinear Slack app’s message event subscriptions paused: its Worker can’t tell such a reply from a new request outside an issue channel, so it would move the reply before Hermes sees it.
 
 For an existing installation, run `hermes plugins update hermes22muse` after setting the key. Restart the gateway and look for `hermes22muse: Muse handoff relay registered`. Ask Hermes for something harmless in a channel it answers, check that the thread shows Hermes’s handoff and Muse’s reply under their respective names, and check that the answer arrives in the channel. For a DM request, check the separate conversation with Muse. Leave the gateway running for ongoing sync.
 

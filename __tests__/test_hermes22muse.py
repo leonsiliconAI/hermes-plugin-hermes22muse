@@ -360,6 +360,9 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"Side chat: https://muse.ai/thread/{JOB}", thread_post)
         self.assertTrue(thread_post.endswith("\n\n" + sent))
         self.assertIn("already belongs", self.call("muse_handoff", task="again")["error"])
+        # AutoLinear leaves Leon's replies in this thread where they are.
+        self.assertTrue(self.adapter._hermes22muse_handoff_thread(TEAM, CHANNEL, REQUEST))
+        self.assertFalse(self.adapter._hermes22muse_handoff_thread(TEAM, CHANNEL, LATER))
 
         # Leon writes in the thread; Hermes forwards it.
         self.session.update(thread_id=REQUEST, message_id=LATER)
