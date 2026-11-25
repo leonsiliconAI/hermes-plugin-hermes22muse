@@ -4,16 +4,13 @@ function slackPermalink(channel, ts) {
 	return "https://app.slack.com/archives/" + channel + "/p" + ts.replaceAll(".", "");
 }
 // policy.ts
-const unfinished = /* @__PURE__ */ new Set([
-	"pending",
-	"queued",
-	"running",
-	"in_progress",
-	"started",
-	"active",
-	"working",
-	"streaming",
-	"generating"
+const finished = /* @__PURE__ */ new Set([
+	"completed",
+	"failed",
+	"interrupted",
+	"cancelled",
+	"canceled",
+	"error"
 ]);
 function history(result, chat, limit) {
 	if (!result.ok || !result.scoped_to_chat) return { error: "scoped history unavailable" };
@@ -37,7 +34,7 @@ function history(result, chat, limit) {
 		const role = name.slice(8);
 		const session = payload.session_id || event.session_id;
 		if (session && session !== chat || payload.role != null && payload.role !== role) continue;
-		if ([payload.display_text_ready, event.display_text_ready].some((ready) => ready === false || ready === 0) || role === "assistant" && unfinished.has(payload.status ?? "")) {
+		if ([payload.display_text_ready, event.display_text_ready].some((ready) => ready === false || ready === 0) || role === "assistant" && !finished.has(payload.status ?? "")) {
 			busy ||= role === "assistant";
 			continue;
 		}
@@ -248,10 +245,11 @@ async function sendInbound(host, job, entry, stamp) {
 	await host.accepted(job.id, entry.ts, await host.send(job.id, text));
 }
 function collectPlan(messages, existing, posted, echoed, full, busy, oldBusy, stamp) {
-	const known = new Set(existing);
+	const known = new Map(existing.map((row) => [row.id, row.text]));
 	const alreadyPosted = new Set(posted);
 	const inbound = new Set(echoed);
 	const rows = messages.filter((message) => !known.has(message.id));
+	const updates = messages.filter((message) => known.has(message.id) && known.get(message.id) !== message.text);
 	const output = [];
 	if (full && !known.size && !alreadyPosted.size && messages.length) output.push({
 		id: "gap/" + messages[0].id,
@@ -265,11 +263,20 @@ function collectPlan(messages, existing, posted, echoed, full, busy, oldBusy, st
 			parts
 		});
 	}
+	for (const message of updates) {
+		const before = known.get(message.id) ?? "";
+		if (message.role === "assistant" && message.text.length > before.length && message.text.startsWith(before)) output.push({
+			id: "update/" + message.id + "/" + message.text.length,
+			parts: slackChunks(message.text).map((chunk) => "Muse (full reply)\n" + chunk)
+		});
+	}
+	const changes = rows.length + updates.length;
 	return {
 		rows,
+		updates,
 		output,
-		activity: rows.length > 0,
-		changed: rows.length > 0 || oldBusy !== void 0 && oldBusy !== busy
+		activity: changes > 0,
+		changed: changes > 0 || oldBusy !== void 0 && oldBusy !== busy
 	};
 }
 function directoryRegistration(current) {

@@ -173,6 +173,21 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.next_inbound(JOB))
         self.assertEqual(len(self.muse.sends), 1)
 
+    async def test_a_reply_stored_cut_off_is_completed_and_posted_in_full(self):
+        self.create()
+        await self.tick()
+        self.muse.chats[JOB].append(Message("answer", "assistant", "**Bottom line:"))
+        await self.tick()
+        self.muse.chats[JOB][-1] = Message("answer", "assistant", "**Bottom line:** no, it doesn't count.")
+        await self.tick()
+        await self.tick()
+        self.settle()
+        await self.tick()
+        self.assertEqual(self.store.answer(JOB), ("answered", [
+            {"from": "muse", "text": "**Bottom line:** no, it doesn't count."},
+        ]))
+        self.assertEqual(posts(self.client)[-1], (REQUEST, "Muse (full reply)\n**Bottom line:** no, it doesn't count."))
+
     async def test_relay_measures_pending_approvals_only_when_asked(self):
         self.create()
         await self.tick()
@@ -431,7 +446,9 @@ class HistoryTests(unittest.TestCase):
 
     def test_unfinished_replies_are_held_back_and_reported(self):
         for row in (self.event("assistant", "draft", "Dra", ready=False, status="completed"),
-                    self.event("assistant", "streaming", "Half a rep", status="streaming")):
+                    self.event("assistant", "streaming", "Half a rep", status="streaming"),
+                    # While Muse streams, the row has no status and only the text so far.
+                    self.event("assistant", "statusless", "**Bottom line:")):
             with self.subTest(row=row["message_id"]):
                 self.assertEqual(history_messages(self.response(row), JOB), ([], False, True))
 

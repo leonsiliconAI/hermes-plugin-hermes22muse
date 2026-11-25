@@ -31,17 +31,9 @@ interface Response {
   response?: Response;
 }
 
-const unfinished = new Set([
-  "pending",
-  "queued",
-  "running",
-  "in_progress",
-  "started",
-  "active",
-  "working",
-  "streaming",
-  "generating",
-]);
+// An assistant row is final only with one of these statuses. While Muse streams a reply its row
+// has no status yet and holds the text so far, so a missing status is not finished.
+const finished = new Set(["completed", "failed", "interrupted", "cancelled", "canceled", "error"]);
 
 export function history(
   result: { ok?: boolean; scoped_to_chat?: string; response?: Response },
@@ -84,7 +76,7 @@ export function history(
       [payload.display_text_ready, event.display_text_ready].some(
         (ready) => ready === false || ready === 0,
       ) ||
-      (role === "assistant" && unfinished.has(payload.status ?? ""))
+      (role === "assistant" && !finished.has(payload.status ?? ""))
     ) {
       // A reply still being written is held back until its final text is ready.
       busy ||= role === "assistant";
@@ -479,7 +471,7 @@ export async function sendInbound(
 
 export function collectPlan(
   messages: Message[],
-  existing: string[],
+  existing: { id: string; text: string }[],
   posted: string[],
   echoed: string[],
   full: boolean,
@@ -487,10 +479,14 @@ export function collectPlan(
   oldBusy: boolean | undefined,
   stamp: string,
 ) {
-  const known = new Set(existing);
+  const known = new Map(existing.map((row) => [row.id, row.text]));
   const alreadyPosted = new Set(posted);
   const inbound = new Set(echoed);
   const rows = messages.filter((message) => !known.has(message.id));
+  // Muse can still change a stored message's text; keep the transcript current.
+  const updates = messages.filter(
+    (message) => known.has(message.id) && known.get(message.id) !== message.text,
+  );
   const output: { id: string; parts: string[] }[] = [];
   if (full && !known.size && !alreadyPosted.size && messages.length) {
     output.push({
@@ -505,11 +501,26 @@ export function collectPlan(
     const parts = slackDelivery(message, inbound.has(message.id), stamp);
     if (parts[0] !== null) output.push({ id: message.id, parts: parts as string[] });
   }
+  for (const message of updates) {
+    const before = known.get(message.id) ?? "";
+    // A reply first stored cut off is posted again in full.
+    if (
+      message.role === "assistant" &&
+      message.text.length > before.length &&
+      message.text.startsWith(before)
+    )
+      output.push({
+        id: "update/" + message.id + "/" + message.text.length,
+        parts: slackChunks(message.text).map((chunk) => "Muse (full reply)\n" + chunk),
+      });
+  }
+  const changes = rows.length + updates.length;
   return {
     rows,
+    updates,
     output,
-    activity: rows.length > 0,
-    changed: rows.length > 0 || (oldBusy !== undefined && oldBusy !== busy),
+    activity: changes > 0,
+    changed: changes > 0 || (oldBusy !== undefined && oldBusy !== busy),
   };
 }
 

@@ -204,21 +204,25 @@ class Store:
             }
             ids = [message.id for message in messages]
             marks = ",".join("?" for _ in ids)
-            known = {row["id"] for row in db.execute(
-                f"SELECT id FROM transcript WHERE handoff=? AND id IN ({marks})", (job_id, *ids),
-            )}
+            known = [{"id": row["id"], "text": row["text"]} for row in db.execute(
+                f"SELECT id, text FROM transcript WHERE handoff=? AND id IN ({marks})", (job_id, *ids),
+            )]
             # Handoffs from 1.x relayed messages before the transcript existed.
             posted = {row["event"] for row in db.execute(
                 f"SELECT DISTINCT event FROM outbound WHERE handoff=? AND event IN ({marks})", (job_id, *ids),
             )}
             old = db.execute("SELECT busy FROM handoffs WHERE id=?", (job_id,)).fetchone()
             plan = call(
-                __file__, "collectPlan", [vars(message) for message in messages], list(known),
+                __file__, "collectPlan", [vars(message) for message in messages], known,
                 list(posted), list(echoed), full, busy, bool(old["busy"]) if old else None, STAMP,
             )
             db.executemany(
                 "INSERT OR IGNORE INTO transcript(handoff, id, role, text) VALUES (?, ?, ?, ?)",
                 ((job_id, row["id"], row["role"], row["text"]) for row in plan["rows"]),
+            )
+            db.executemany(
+                "UPDATE transcript SET text=? WHERE handoff=? AND id=?",
+                ((row["text"], job_id, row["id"]) for row in plan["updates"]),
             )
             for item in plan["output"]:
                 self._add_output(db, job_id, item["id"], item["parts"])
