@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, call as mock_call, patch
@@ -1094,6 +1095,28 @@ class HistoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChunkTests(unittest.TestCase):
+    def test_a_chunk_ends_at_a_line_break_in_its_second_half(self):
+        text = "a" * 3000 + "\n" + "b" * 1000 + "\n" + "c" * 5000
+        chunks = list(relay_module.slack_chunks(text))
+        self.assertEqual("".join(chunks), text)
+        # The first break is in the chunk's second half and is used; the next one is too early.
+        self.assertEqual([len(chunk) for chunk in chunks], [3001, 3400, 2601])
+
+    def test_one_long_line_takes_time_in_proportion_to_its_length(self):
+        # JavaScript holds Python's interpreter lock while it runs, so a search that went back to the
+        # start of the text for every chunk stopped all of Hermes for the square of the length.
+        def seconds(length):
+            started = time.perf_counter()
+            list(relay_module.slack_chunks("x" * length))
+            return time.perf_counter() - started
+
+        seconds(1000)
+        small = min(seconds(800_000), seconds(800_000))
+        large = min(seconds(3_200_000), seconds(3_200_000))
+        self.assertLess(large, max(8 * small, 0.5))
 
 
 class FakeGateway:

@@ -124,8 +124,11 @@ function slackChunks(text) {
 		let cut = Math.min(rest.length - start, 3400);
 		while (Array.from(escapeSlack(rest.slice(start, start + cut).join(""))).length > 3400) cut = Math.floor(cut / 2);
 		if (start + cut < rest.length) {
-			const newline = rest.lastIndexOf("\n", start + cut - 1);
-			if (newline >= start + Math.floor(cut / 2)) cut = newline + 1 - start;
+			const earliest = start + Math.floor(cut / 2);
+			for (let index = start + cut - 1; index >= earliest; index--) if (rest[index] === "\n") {
+				cut = index + 1 - start;
+				break;
+			}
 		}
 		chunks.push(escapeSlack(rest.slice(start, start + cut).join("")));
 		start += cut;
