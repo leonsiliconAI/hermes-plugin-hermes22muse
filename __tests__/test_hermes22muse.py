@@ -111,7 +111,7 @@ GATEWAY = {"gateway": SimpleNamespace(), "gateway.platforms": SimpleNamespace(),
 
 
 def posts(client):
-    return [(call.kwargs["thread_ts"], call.kwargs["text"]) for call in client.chat_postMessage.await_args_list]
+    return [(call.kwargs.get("thread_ts"), call.kwargs["text"]) for call in client.chat_postMessage.await_args_list]
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
@@ -784,7 +784,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.client.chat_postMessage.assert_awaited_once()
         post = self.client.chat_postMessage.await_args.kwargs
         self.assertNotIn("thread_ts", post)
-        self.assertEqual(post["text"], "*Task progress*")
+        self.assertEqual(post["text"], "Thinking…")
         root = opening.source.thread_id
         self.assertNotEqual(root, REQUEST)
         self.assertEqual(opening.source.message_id, REQUEST)
@@ -828,7 +828,9 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.client.chat_postMessage.assert_awaited_once()
         update = self.client.chat_update.await_args.kwargs
         self.assertEqual(update["ts"], root)
-        self.assertIn("Task progress", update["text"])
+        self.assertTrue(update["text"].startswith("Progress\n"))
+        heading = update["blocks"][0]["elements"][0]["elements"][0]
+        self.assertEqual(heading, {"type": "text", "text": "Progress", "style": {"underline": True}})
         self.assertIn("Browser check confirmed requirement A.", update["text"])
         self.assertIn("Which constraints apply?", update["text"])
         self.assertEqual(progress.read(route)["card"], root)
@@ -854,6 +856,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update["ts"], root)
         self.assertIn("Verified requirement A.", update["text"])
         self.assertIn("To Codex: The limit is 20.", update["text"])
+        self.assertIn((root, "Verified requirement A. Codex is applying the limit."), posts(self.client))
         self.assertFalse(self.call("slack_task_progress")["queued"])
 
         progress.finish(route, "Verified the result.\n\n@Autolinear move done")
@@ -899,16 +902,50 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         await self.store.progress.flush(publisher)
         update = self.client.chat_update.await_args.kwargs
         self.assertEqual(update["ts"], root)
-        self.assertEqual(update["text"], "*Task progress*\n\n*Quick answer from Hermes*\nProbably 12 events, every "
-                                         "Thursday since September. I'll delete them all and check that none are "
-                                         "left.\n&lt;!channel&gt;")
+        quick = ("Probably 12 events, every Thursday since September. "
+                 "I'll delete them all and check that none are left.")
+        self.assertEqual(update["text"], quick + "\n&lt;!channel&gt;")
+        [quick_block] = update["blocks"]
+        self.assertEqual(quick_block["elements"][0]["elements"], [
+            {"type": "text", "text": quick + "\n<!channel>"}])
         self.assertNotIn("[Task progress]", self.hooks["pre_llm_call"](platform="slack")["context"])
+        self.assertIn("post brief progress replies", self.hooks["pre_llm_call"](platform="slack")["context"])
+
+        # A queued assignment is not an agent reply and does not show a Progress heading.
+        with self.store.connection() as db:
+            self.store.progress.report(db, route, "Muse", "", REQUEST, "Assigned. Waiting for the first reply.")
+        await self.store.progress.flush(publisher)
+        self.assertEqual(self.client.chat_update.await_args.kwargs["text"], quick + "\n&lt;!channel&gt;")
+
+        # Hermes can post a checked milestone while working. Retry only once and keep it after a restart.
+        note = "Found the recurring series. The calendar identifies all 12 dates."
+        self.assertTrue(self.call("slack_task_progress", summary=note)["queued"])
+        send = self.client.chat_postMessage.side_effect
+        self.client.chat_postMessage.side_effect = TimeoutError
+        await self.store.progress.flush(publisher)
+        attempt = self.client.chat_postMessage.await_args.kwargs
+        self.assertEqual(attempt["thread_ts"], root)
+        self.assertEqual(attempt["text"], note)
+        self.assertEqual(attempt["blocks"][0]["text"], {"type": "plain_text", "text": note})
+        with self.store.connection() as db:
+            db.execute("UPDATE progress_notes SET due=0")
+        self.client.chat_postMessage.side_effect = send
+        await Store(self.store.directory).progress.flush(publisher)
+        self.assertEqual(self.client.chat_postMessage.await_args.kwargs["client_msg_id"], attempt["client_msg_id"])
+        self.assertFalse(self.call("slack_task_progress", summary=note)["queued"])
+        await self.store.progress.flush(publisher)
+        self.assertEqual(posts(self.client).count((root, note)), 2)  # Initial request and retry only.
+        update = self.client.chat_update.await_args.kwargs
+        self.assertEqual(update["text"], quick + "\n&lt;!channel&gt;\n\nProgress\n> " + note)
+        heading = update["blocks"][1]["elements"][0]["elements"][0]
+        self.assertEqual(heading, {"type": "text", "text": "Progress", "style": {"underline": True}})
 
         # The full answer joins the quick one; slack22linear still reads only the answer after its heading.
         self.store.progress.finish(route, "Removed all 12 events.\n\n@Autolinear move done")
         await self.store.progress.flush(publisher)
         text = self.client.chat_update.await_args.kwargs["text"]
-        self.assertIn("*Quick answer from Hermes*\nProbably 12 events", text)
+        self.assertTrue(text.startswith(quick))
+        self.assertNotIn("\n\nProgress\n", text)
         heading = "\n\n*Update from Hermes*\n"
         self.assertEqual(text.count(heading), 1)
         self.assertEqual(text[text.index(heading) + len(heading):],
@@ -917,6 +954,20 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         # A session that started before 2.13.0 still has the plan wording.
         result = self.call("slack_task_progress", plan="I'll check the calendar again.")
         self.assertEqual(result["quick_answer"], "I'll check the calendar again.")
+
+    async def test_long_final_answers_fit_slack_blocks_and_keep_the_command_text(self):
+        root = (await self.build_turn()).source.thread_id
+        first = "Results:\n" + "A verified result.\n" * 140
+        second = "The last result.\n\n@Autolinear move done"
+        answer = first + "Another verified result.\n" * 40 + second
+        self.adapter.truncate_message = Mock(return_value=[first, answer[len(first):]])
+        self.store.progress.finish((TEAM, CHANNEL, root), answer)
+        await self.store.progress.flush(Slack(self.adapter, BOT_TOKEN))
+        update = self.client.chat_update.await_args.kwargs
+        self.adapter.truncate_message.assert_called_once_with(answer, 2900)
+        self.assertEqual(update["text"], "*Update from Hermes*\n" + answer)
+        self.assertEqual(len(update["blocks"]), 2)
+        self.assertTrue(all(len(block["text"]["text"]) <= 3000 for block in update["blocks"]))
 
     async def test_only_the_task_progress_thread_changes_the_card(self):
         """Leon, 2026-11-26: "after i ask a follow up, hermes should NOT edit the original message. the original
@@ -943,9 +994,11 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.session.update(thread_id=root, message_id=LATER)
         guide = self.hooks["pre_llm_call"](platform="slack")["context"]
         self.assertTrue(guide.startswith("[Task progress] Leon wrote this message at the top of the issue channel"))
-        for change in ({"summary": "Grok Bot is the browser agent."}, {"quick_answer": "It's Grok Bot."}):
-            self.assertIn("only messages in that thread change Task progress",
-                          self.call("slack_task_progress", **change)["error"])
+        self.assertIn("only messages in that thread change Task progress",
+                      self.call("slack_task_progress", quick_answer="It's Grok Bot.")["error"])
+        self.assertTrue(self.call("slack_task_progress", summary="Grok Bot is the browser agent.")["queued"])
+        await progress.flush(Slack(self.adapter, BOT_TOKEN))
+        self.assertIn((root, "Grok Bot is the browser agent."), posts(self.client))
         self.assertEqual(self.call("slack_task_progress")["latest_answer"], first)
         draft = await self.adapter.send(CHANNEL, "The browser", metadata={
             **thread, "expect_edits": True, "reply_to_message_id": LATER})
@@ -980,6 +1033,12 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update["ts"], root)
         self.assertTrue(update["text"].endswith("*Update from Hermes*\nIt's Grok Bot.\n\n@Autolinear move done"))
         self.assertNotIn("The browser agent is Grok Bot.", update["text"])
+
+        # Gateway commentary is public interim text and can be sent in the thread without changing the outcome.
+        interim = {**thread, "_interim_send": True, "notify": True, "reply_to_message_id": in_thread}
+        await self.adapter.send(CHANNEL, "Grok Bot confirmed the active account.", reply_to=in_thread, metadata=interim)
+        self.assertEqual(sent[-1], (CHANNEL, "Grok Bot confirmed the active account.", in_thread, interim))
+        self.assertEqual(progress.read(route)["answer"], "It's Grok Bot.\n\n@Autolinear move done")
 
     async def test_cards_from_before_plans_keep_working(self):
         with self.store.connection() as db:

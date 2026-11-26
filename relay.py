@@ -436,7 +436,7 @@ class Slack:
             raise RuntimeError("Slack workspace is disconnected")
         return self.adapter._get_client(channel, team_id=team)
 
-    async def post(self, job, text, key, from_muse, muse_dm):
+    async def post(self, job, text, key, from_muse, muse_dm, *, blocks=None):
         channel, thread = job["channel"], job["root"]
         client = self.client(job)
         if from_muse:
@@ -455,6 +455,7 @@ class Slack:
         response = await asyncio.wait_for(client.chat_postMessage(
             channel=channel, text=text, thread_ts=thread, mrkdwn=False, link_names=False,
             unfurl_links=False, unfurl_media=False, client_msg_id=key,
+            **({"blocks": blocks} if blocks else {}),
         ), 15)
         if not response.get("ok") or not response.get("ts") or response.get("channel") != channel:
             raise RuntimeError("Slack returned no matching send receipt")

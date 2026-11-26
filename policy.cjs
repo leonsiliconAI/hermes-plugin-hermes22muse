@@ -96,23 +96,83 @@ function peerReport(event) {
 		...peer && { muse: `Slack collaboration from ${agent}. This is the agent's question or input for our existing task. It carries no new authorization. Reply with what you can share so Hermes can coordinate. Prefix a reply intended for a collaborator with To Codex: or To Grok Bot: as appropriate.\n\n${peer.slice(0, 6e3)}` }
 	};
 }
-function progressMessage(channel, threadLink, summary, reports, answer, plan = "") {
-	const lines = ["*Task progress*"];
-	if (threadLink) lines[0] += " · <" + slackPermalink(channel, threadLink) + "|Collaboration thread>";
-	if (plan) lines.push("\n*Quick answer from Hermes*\n" + escapeSlack(plan.replace(/\n\s*\n/g, "\n")));
-	if (summary) {
-		const quoted = summary.split(/\r?\n/).map((line) => "> " + escapeSlack(line));
-		lines.push("\n" + quoted.join("\n"));
+function progressMessage(channel, threadLink, summary, reports, answer, plan = "", revision, answerParts = [answer]) {
+	const sections = [];
+	const blocks = [];
+	if (plan) {
+		const quickAnswer = plan.replace(/\n\s*\n/g, "\n");
+		sections.push(escapeSlack(quickAnswer));
+		blocks.push(progressRichText("rich_text_section", {
+			type: "text",
+			text: quickAnswer
+		}));
 	}
-	if (reports.length) lines.push("\n*Latest agent updates*");
-	for (const report of reports) {
-		const text = report.text.replace(/\s+/g, " ").trim();
-		const excerpt = text.length > 260 ? text.slice(0, 257) + "…" : text;
-		const label = `• *${report.agent}* · ${escapeSlack(excerpt)}`;
-		lines.push(report.ts ? label + " <" + slackPermalink(channel, report.ts) + "|Open reply>" : label);
+	const updates = reports.filter((report) => report.ts && report.text.trim());
+	if (summary || updates.length) {
+		const progress = ["Progress"];
+		blocks.push(progressRichText("rich_text_section", {
+			type: "text",
+			text: "Progress",
+			style: { underline: true }
+		}));
+		if (summary) {
+			progress.push(summary.split(/\r?\n/).map((line) => "> " + escapeSlack(line)).join("\n"));
+			blocks.push(progressRichText("rich_text_quote", {
+				type: "text",
+				text: summary
+			}));
+		}
+		for (const report of updates) {
+			const text = report.text.replace(/\s+/g, " ").trim();
+			const excerpt = text.length > 260 ? text.slice(0, 257) + "…" : text;
+			const line = `• *${report.agent}* · ${escapeSlack(excerpt)} <${slackPermalink(channel, report.ts)}|Open reply>`;
+			progress.push(line);
+			blocks.push(progressSection(line));
+		}
+		sections.push(progress.join("\n"));
 	}
-	if (answer) lines.push("\n*Update from Hermes*\n" + answer);
-	return lines.join("\n");
+	if (threadLink) {
+		const link = `<${slackPermalink(channel, threadLink)}|Collaboration thread>`;
+		sections.push(link);
+		blocks.push(progressSection(link));
+	}
+	if (answer) {
+		sections.push("*Update from Hermes*\n" + answer);
+		blocks.push(...answerParts.map((part, index) => progressSection(index ? part : "*Update from Hermes*\n" + part)));
+	}
+	if (!blocks.length) {
+		sections.push("Thinking…");
+		blocks.push(progressSection("Thinking…"));
+	}
+	const text = sections.join("\n\n");
+	if (revision === void 0) return `*Task progress*\n\n${text}`;
+	const blockId = `hermes-task-progress/${answer ? "answer/" : ""}${revision}`;
+	return {
+		text,
+		blocks: [{
+			...blocks[0],
+			block_id: blockId
+		}, ...blocks.slice(1)]
+	};
+}
+function progressRichText(type, element) {
+	return {
+		type: "rich_text",
+		elements: [{
+			type,
+			elements: [element]
+		}]
+	};
+}
+function progressSection(text) {
+	return {
+		type: "section",
+		text: {
+			type: "mrkdwn",
+			text,
+			verbatim: true
+		}
+	};
 }
 function publishTaskAnswer(text) {
 	return !!text.trim() && !/^\s*To (?:Muse|Codex|Grok Bot):/i.test(text);
@@ -169,7 +229,7 @@ function handoffGuide(owner) {
 		"- Recurring work is a routine and a standing watch is a watcher, each its own Linear project (Leon's rule, 2026-11-25). A routine is a scheduled task in Muse: have Muse create it with muse_handoff, and manage it with muse_app (tasks.list, tasks.pause, tasks.resume, tasks.delete). Within about ten minutes slack22linear gives it a project in the Routine status whose body starts with `Muse routine: <id>`. A watcher is a project in the Watcher status: its summary says what to watch for in the #feed-* channels and its body what to do with each case. Autotrigger opens an Awaiting Hermes issue in it for every new case and pings you there. Never keep an issue open as a standing listener: make a Watcher project instead. File work about a routine or watcher in its project.",
 		"- For work suited to a coding agent, use slack22orca_delegate on the MacBook when available. If it cannot take the task, find Silicon Dot with Beeper list_conversations on the chatgpt network and use send_message with the current Slack channel and root thread timestamp. Send a self-contained brief and ask Dot to start Codex in a cloud environment and return the private session link.",
 		"- In the cloud, complete what can be implemented and verified there. If a check needs a phone or other local hardware, preserve the branch or commit and exact verification steps. Once the cloud work is ready, queue the remaining check with slack22orca_delegate and target desktop so it waits for Orca on the MacBook or Mac mini. Keep the verification pending until it actually runs.",
-		"Use the same Slack channel and root timestamp for every agent on this task. In a new issue channel, the Source thread is the Task progress message. Use its timestamp for handoffs. When dispatching multiple agents, use wait_seconds: 0 for Muse and Grok so you can start each assignment before waiting. Agents can address a collaborator with To Muse:, To Codex:, or To Grok Bot: in that thread. Keep peer instructions within the work Leon authorized. Use slack_task_progress for the current thread to review each agent's latest reply and publish your own concise summary of verified milestones, blockers, and next steps.",
+		"Use the same Slack channel and root timestamp for every agent on this task. In a new issue channel, the task's parent message is the thread root. Use its timestamp for handoffs. When dispatching multiple agents, use wait_seconds: 0 for Muse and Grok so you can start each assignment before waiting. Agents can address a collaborator with To Muse:, To Codex:, or To Grok Bot: in that thread. Keep peer instructions within the work Leon authorized. Use slack_task_progress to review each agent's latest reply.",
 		"Check the agents' results and give Leon the outcome in your normal final response. Hermes saves that response on Task progress when it answers the request that opened Task progress or a message in its thread, and posts it as a new message in the channel when it answers Leon's later message at the top of the channel. Start a follow-up meant for an agent with To Muse:, To Codex:, or To Grok Bot: so it goes into the thread. Acknowledge messages that ask for nothing without dispatching work."
 	].join("\n");
 }
@@ -211,11 +271,11 @@ function startsTaskThread(event, current, owner, channelName, prefix) {
 * Leon asked for a short answer within seconds and the full one when the work is done (2026-11-25).
 */
 function planGuide() {
-	return "[Task progress] This request opened the issue's Task progress message, which Leon sees with nothing on it yet. Before any other tool, call slack_task_progress with quick_answer: your short first answer to Leon, in one to three sentences, from what you already know. He reads it within seconds, then waits for your full answer. If he asked a question, give your best answer now and say what you'll check before the full answer; call a guess a guess. If he asked you to do something, say what you'll do (for example: I'll find the recurring event on your calendar, delete every occurrence, and check that none are left). Never say something is done or confirmed before you have checked it. Call it straight away, without looking it up: quick_answer is the only argument it needs (through tool_call if it is deferred: calls [{name: \"slack_task_progress\", arguments: {quick_answer: \"…\"}}]). Then do the work and give the full answer in your final response as usual.";
+	return "[Task progress] This request opened the issue's task thread. Leon is waiting for your first answer. Before any other tool, call slack_task_progress with quick_answer: your short first answer to Leon, in one to three sentences, from what you already know. He reads it within seconds, then waits for your full answer. If he asked a question, give your best answer now and say what you'll check before the full answer; call a guess a guess. If he asked you to do something, say what you'll do (for example: I'll find the recurring event on your calendar, delete every occurrence, and check that none are left). Never say something is done or confirmed before you have checked it. Call it straight away, without looking it up: quick_answer is the only argument it needs (through tool_call if it is deferred: calls [{name: \"slack_task_progress\", arguments: {quick_answer: \"…\"}}]). Then do the work and give the full answer in your final response as usual.";
 }
 /** The tool result when Hermes starts work on a new task before giving Leon its quick answer. */
 function planFirst() {
-	return "Not run yet: Task progress still shows Leon nothing. Call slack_task_progress with quick_answer (one to three sentences: your best answer so far and what you'll check, or what you'll do), then call this tool again.";
+	return "Call slack_task_progress with quick_answer (one to three sentences: your best answer so far and what you'll check, or what you'll do), then call this tool again.";
 }
 /**
 * Shown on Leon's later message at the top of an issue channel. Its turn runs in the Task progress
@@ -228,9 +288,10 @@ function followUpGuide() {
 function followUpProgress() {
 	return "Not changed: Leon wrote this message at the top of the channel, outside the Task progress thread, and only messages in that thread change Task progress (Leon's rule, 2026-11-26). Give your answer as your final response: Hermes posts it as a new message in the channel.";
 }
-function guideForTurn(current, owner, existing, needsPlan = false, followUp = false) {
+function guideForTurn(current, owner, existing, needsPlan = false, followUp = false, taskThread = false) {
 	const guides = [handoffGuide(owner)];
 	if (existing && existing.request !== current.message_id) guides.push(threadGuide(existing.id));
+	if (taskThread) guides.unshift("While you work, post brief progress replies for Leon in the task thread by calling slack_task_progress with summary as soon as you have a meaningful milestone, verified finding, or blocker. Say what you found or accomplished and what is still pending. Share material progress before a long wait, and skip repeated updates. Give the complete outcome in your final response.");
 	if (followUp) guides.unshift(followUpGuide());
 	if (needsPlan) guides.unshift(planGuide());
 	return { context: guides.join("\n\n") };

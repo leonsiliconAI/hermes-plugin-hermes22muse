@@ -2,6 +2,8 @@
 
 import asyncio
 import functools
+from html import escape
+import json
 import logging
 import time
 import uuid
@@ -29,6 +31,13 @@ class Progress:
                     revision TEXT NOT NULL, text TEXT NOT NULL,
                     PRIMARY KEY(team, channel, root, agent)
                 );
+                CREATE TABLE IF NOT EXISTS progress_notes (
+                    id INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL,
+                    team TEXT NOT NULL, channel TEXT NOT NULL, root TEXT NOT NULL, text TEXT NOT NULL,
+                    due REAL NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS progress_notes_pending
+                    ON progress_notes(team, channel, root, id) WHERE published=0;
                 -- Leon's later top-level messages in an issue channel. Their turns run in the card's
                 -- thread, for its context, but their answers never change the card.
                 CREATE TABLE IF NOT EXISTS progress_follow_ups (
@@ -118,9 +127,21 @@ class Progress:
 
     def update(self, route, summary):
         with self.connection() as db:
-            self._changed(db, route)
-            db.execute("UPDATE progress SET summary=?, answer='' WHERE team=? AND channel=? AND root=?",
-                       (summary, *route))
+            self._set_summary(db, route, summary)
+
+    def _set_summary(self, db, route, summary):
+        self._changed(db, route)
+        db.execute("UPDATE progress SET summary=?, answer='' WHERE team=? AND channel=? AND root=?",
+                   (summary, *route))
+
+    def queue_note(self, route, request, summary, *, thread_only=False):
+        key = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([*route, request, summary])))
+        with self.connection() as db:
+            added = db.execute("INSERT OR IGNORE INTO progress_notes(key, team, channel, root, text) "
+                               "VALUES (?, ?, ?, ?, ?)", (key, *route, summary)).rowcount
+            if added and not thread_only:
+                self._set_summary(db, route, summary)
+        return bool(added)
 
     def has_card(self, route):
         with self.connection() as db:
@@ -173,14 +194,42 @@ class Progress:
                     db.execute("UPDATE progress SET card=?, published=?, due=0 "
                                "WHERE team=? AND channel=? AND root=?",
                                (ts, entry["version"], *route))
+        await self._flush_notes(slack)
+
+    async def _flush_notes(self, slack):
+        with self.connection() as db:
+            notes = db.execute("""
+                SELECT * FROM progress_notes note WHERE published=0 AND due <= ? AND NOT EXISTS (
+                    SELECT 1 FROM progress_notes earlier WHERE earlier.published=0 AND earlier.id < note.id
+                    AND earlier.team=note.team AND earlier.channel=note.channel AND earlier.root=note.root
+                ) ORDER BY id LIMIT 8
+            """, (time.time(),)).fetchall()
+        for note in notes:
+            blocks = [{"type": "section", "block_id": f"hermes-task-progress-note/{note['key']}",
+                       "text": {"type": "plain_text", "text": note["text"]}}]
+            try:
+                await slack.post(note, escape(note["text"], quote=False), note["key"], False, None, blocks=blocks)
+            except Exception as exc:
+                headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                delay = call(__file__, "retryDelay", 0, str(headers.get("Retry-After", "")))
+                with self.connection() as db:
+                    db.execute("UPDATE progress_notes SET due=? WHERE id=?",
+                               (time.time() + max(delay, 15), note["id"]))
+                LOG.warning("Slack task note delivery deferred for %s:%s (%s)",
+                            note["channel"], note["root"], type(exc).__name__)
+            else:
+                with self.connection() as db:
+                    db.execute("UPDATE progress_notes SET published=1 WHERE id=?", (note["id"],))
 
     async def _publish(self, slack, entry):
         channel, root = entry["channel"], entry["root"]
         client = slack.client(entry)
         thread_link = root if root != entry["card"] else None
-        text = call(__file__, "progressMessage", channel, thread_link, entry["summary"], entry["reports"],
-                    entry["answer"], entry["plan"])
-        args = dict(channel=channel, text=text, link_names=False)
+        answer = entry["answer"]
+        parts = slack.adapter.truncate_message(answer, 2900) if len(answer) > 2900 else [answer]
+        message = call(__file__, "progressMessage", channel, thread_link, entry["summary"], entry["reports"],
+                       answer, entry["plan"], entry.get("version", 0), parts)
+        args = dict(channel=channel, link_names=False, **message)
         if entry["card"]:
             response = await asyncio.wait_for(client.chat_update(ts=entry["card"], **args), 15)
         else:
@@ -214,6 +263,8 @@ def wire_progress_delivery(adapter, progress):
 
     @functools.wraps(send)
     async def send_to_progress(chat_id, content, reply_to=None, metadata=None):
+        if metadata and metadata.get("_interim_send"):
+            return await send(chat_id, content, reply_to=reply_to, metadata=metadata)
         if metadata and (metadata.get("expect_edits") or
                          (metadata.get("notify") and (metadata.get("reply_to_message_id") or
                                                       metadata.get("_hermes_task_answer")))):
