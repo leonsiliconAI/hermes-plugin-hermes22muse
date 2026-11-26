@@ -120,7 +120,7 @@ hermes plugins install leonsiliconAI/hermes-plugin-hermes22muse --enable --yes-d
 
 If the profile runs AutoLinear, use 1.6.0 or later. AutoLinear creates the issue and channel, and Hermes decides how to handle the request there. Replies in a Muse handoff thread stay there. Keep the separate AutoLinear Slack app’s message event subscriptions paused so intake starts in the gateway and can recognize those replies.
 
-For an existing installation, run `hermes plugins update hermes22muse` and restart the gateway. Look for `hermes22muse: Muse handoff relay registered`. Verify that a routine request in a new issue channel shows Hermes's quick answer on **Task progress** within seconds and the full answer when it finishes, and that an explicit Muse research request relays the side chat in its thread. For a DM request sent to Muse, check the separate conversation with Muse.
+For an existing installation, run `hermes plugins update hermes22muse` and restart the gateway. Installing, enabling or updating any plugin reloads every plugin inside the running gateway. The reloaded hermes22muse keeps using the relay that is already running, so its tools and guidance keep working, but new relay code waits for the restart. Look for `hermes22muse: Muse handoff relay registered`. Verify that a routine request in a new issue channel shows Hermes's quick answer on **Task progress** within seconds and the full answer when it finishes, and that an explicit Muse research request relays the side chat in its thread. For a DM request sent to Muse, check the separate conversation with Muse.
 
 ## Delivery and recovery
 

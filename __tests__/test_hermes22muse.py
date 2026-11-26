@@ -583,6 +583,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
             "HERMES22MUSE_MCP_URL": "http://127.0.0.1:7899/mcp",
             "HERMES22MUSE_MCP_SECRET": "x" * 32,
         }
+        self.env = env
         with patch.dict(os.environ, env):
             plugin.register(ctx)
         self.adapter, self.client = fake_adapter()
@@ -609,6 +610,22 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
 
     def call(self, name, **args):
         return json.loads(self.tools[name](args))
+
+    def register_again(self):
+        """What `hermes plugins install` does to the running gateway: the plugin registers again and
+        Hermes wires the new copy on the live adapter."""
+        tools, hooks = {}, {}
+        ctx = SimpleNamespace(
+            register_tool=lambda name, handler, **kw: tools.__setitem__(name, handler),
+            register_platform_handler=lambda platform, factory: setattr(ctx, "wire", factory),
+            register_hook=lambda name, callback: hooks.__setitem__(name, callback),
+        )
+        with patch.dict(os.environ, self.env):
+            plugin.register(ctx)
+        constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
+        with patch.dict(sys.modules, {"hermes_constants": constants}), patch.object(plugin, "keep_crash_log"):
+            ctx.wire(None, self.adapter)
+        return tools, hooks
 
     async def build_turn(self, ts=REQUEST, name="leon-1-test", **raw):
         return await self.adapter._build_message_event({"ts": ts, "user": OWNER, **raw}, name=name)
@@ -664,6 +681,24 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["id"] for row in self.store.unread_answers(OWNER, now - 3600)], [JOB])
         self.assertEqual(self.call("muse_wait")["status"], "answered")
         self.assertEqual(self.store.unread_answers(OWNER, now - 3600), [])
+
+    async def test_a_live_plugin_reload_keeps_using_the_running_relay(self):
+        # LEON-527 (2026-11-25): after a reload the new copy had no relay, so Leon's request got no guide.
+        root = (await self.build_turn()).source.thread_id
+        tools, hooks = self.register_again()
+        relay = self.adapter._hermes22muse_relay
+        self.session.update(thread_id=root)
+        guide = hooks["pre_llm_call"](platform="slack", session_id="s", turn_id="t")["context"]
+        self.assertTrue(guide.startswith("[Task progress]"))
+        self.assertIn("[Agent routing]", guide)
+        # The running relay reports the reloaded copy's turns to autolinear.
+        self.assertIn(CHANNEL, relay.turns.running())
+        # Looking the tool up isn't turned away; the first other tool is.
+        self.assertIsNone(hooks["pre_tool_call"](tool_name="tool_describe", args={"names": ["slack_task_progress"]}))
+        self.assertEqual(hooks["pre_tool_call"](tool_name="terminal", args={})["action"], "block")
+        result = json.loads(tools["slack_task_progress"]({"quick_answer": "I'll check your calendar."}))
+        self.assertEqual(result["quick_answer"], "I'll check your calendar.")
+        self.assertIs(self.adapter._hermes22muse_relay, relay)
 
     async def test_turn_hooks_never_get_in_hermess_way(self):
         self.assertIsNotNone(self.hooks["pre_llm_call"](platform="slack", session_id="s", turn_id="t"))

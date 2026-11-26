@@ -376,7 +376,9 @@ export function planGuide() {
     "If he asked a question, give your best answer now and say what you'll check before the full answer; call a guess " +
     "a guess. If he asked you to do something, say what you'll do (for example: I'll find the recurring event on your " +
     "calendar, delete every occurrence, and check that none are left). Never say something is done or confirmed " +
-    "before you have checked it. Then do the work and give the full answer in your final response as usual."
+    "before you have checked it. Call it straight away, without looking it up: quick_answer is the only argument it " +
+    'needs (through tool_call if it is deferred: calls [{name: "slack_task_progress", arguments: {quick_answer: ' +
+    '"…"}}]). Then do the work and give the full answer in your final response as usual.'
   );
 }
 

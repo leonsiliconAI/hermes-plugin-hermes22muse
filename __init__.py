@@ -494,7 +494,9 @@ def register(ctx):
 
         Hermes blocks every tool when this hook raises or hangs, so it stays in Python and SQLite and
         catches everything. The card's row already shows that Leon's own message opened it."""
-        if relay is None or tool_name == PROGRESS_SCHEMA["name"]:
+        # Hermes loads plugin tools on demand: it may look up slack_task_progress itself first, and
+        # turning that lookup away cost LEON-528 a round. tool_call reaches this hook as the tool it calls.
+        if relay is None or tool_name in (PROGRESS_SCHEMA["name"], "tool_search", "tool_describe"):
             return None
         try:
             current = session()
@@ -545,8 +547,20 @@ def register(ctx):
                                              report["ts"], report["revision"], report["text"])
 
     def wire(_native, adapter):
-        nonlocal relay
+        nonlocal relay, web, turns
         if getattr(adapter, "_hermes22muse_worker", None):
+            running = getattr(adapter, "_hermes22muse_relay", None)
+            if running is not None and running is not relay:
+                # `hermes plugins install` and `enable` reload every plugin inside the running gateway
+                # and wire the reloaded copy on the live adapter. The relay keeps running there, so this
+                # copy's tools and hooks use it, with its muse.ai login and turn list, until the next
+                # restart. Before 2.13.1 they kept relay=None: no guide, no tools (LEON-527, 2026-11-25).
+                relay = running
+                if running.web is not None:
+                    web = running.web
+                if running.turns is not None:
+                    turns = running.turns
+                LOG.info("hermes22muse: reusing the running Muse handoff relay after a plugin reload")
             return
         from hermes_constants import get_hermes_home
 
@@ -557,6 +571,7 @@ def register(ctx):
         worker = asyncio.create_task(current.run())
         relay = current
         adapter._hermes22muse_worker = worker
+        adapter._hermes22muse_relay = current
         # Older AutoLinear versions use the ownership hook to skip direct Codex dispatch.
         # The thread hook keeps replies in an existing collaboration thread, even without Muse.
         adapter._hermes22muse_owns_request = owns_slack_request
@@ -618,6 +633,7 @@ def register(ctx):
                     adapter._build_message_event = build
                 adapter.disconnect = disconnect
                 adapter._hermes22muse_worker = None
+                adapter._hermes22muse_relay = None
                 await disconnect(*args, **kwargs)
 
         adapter.disconnect = disconnect_and_stop

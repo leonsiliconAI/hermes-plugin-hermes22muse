@@ -1,5 +1,5 @@
 name: hermes22muse
 label: hermes22muse
-version: 2.13.0
+version: 2.13.1
 description: Let Hermes hand Slack requests to Muse side chats, relay Muse’s replies through a dedicated Slack bot, answer in the channel, and work the Muse app as the user.
 author: leonsilicon
