@@ -9,7 +9,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing, contextmanager
-from ._pythonmonkey import acall_with_host, call
+from ._bridge import acall_with_host, call
 from .muse import STAMP
 from .progress import Progress
 

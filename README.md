@@ -131,7 +131,7 @@ A Muse reply counts only once its row has a final status such as `completed`: wh
 
 Handoffs from 1.x keep their top-level threads, and messages they already relayed are not posted again. Hermes 2.0 no longer takes requests at gateway admission, so the user's replies in a handoff thread reach Hermes, which passes them on with `muse_reply`.
 
-From the repository root, build the policy with `vp -C apps/hermes-plugin-hermes22muse pack`. Then run `uv run --no-project --python 3.14 --with pythonmonkey==1.5.1 --with cryptography --with pytest python -m pytest --rootdir=. --import-mode=importlib apps/hermes-plugin-hermes22muse/__tests__`.
+From the repository root, build the policy with `vp -C apps/hermes-plugin-hermes22muse pack`. Then run `uv run --no-project --python 3.14 --with pygls==2.1.1 --with cryptography --with pytest python -m pytest --rootdir=. --import-mode=importlib apps/hermes-plugin-hermes22muse/__tests__`.
 
 ## Muse projects evaluated
 

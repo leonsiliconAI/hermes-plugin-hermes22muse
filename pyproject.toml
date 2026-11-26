@@ -1,5 +1,5 @@
 [project]
 name = "hermes-plugin-hermes22muse"
-version = "2.14.2"
+version = "2.14.3"
 requires-python = ">=3.11"
-dependencies = ["pythonmonkey==1.5.1"]
+dependencies = ["pygls==2.1.1"]

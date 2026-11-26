@@ -11,7 +11,7 @@ import sys
 import time
 from contextlib import suppress
 
-from ._pythonmonkey import blocking, call
+from ._bridge import blocking, call
 from .muse import Muse
 from .museweb import ROUTES, MuseApiError, MuseLoginRequired, MuseWeb, MuseWebError
 from .progress import wire_progress_delivery

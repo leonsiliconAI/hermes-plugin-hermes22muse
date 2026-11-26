@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from ._pythonmonkey import call
+from ._bridge import call
 
 CALLER = "hermes22muse"
 STAMP = f"⟦via muse-mcp · from {CALLER}⟧ "
