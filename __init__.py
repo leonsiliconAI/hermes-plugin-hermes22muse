@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from contextlib import suppress
 
@@ -230,6 +231,20 @@ def keep_crash_log(home):
         LOG.warning("hermes22muse: could not keep a gateway crash log", exc_info=True)
 
 
+# Where the relay running in this gateway process is kept, as (relay, worker task). It lives on
+# `sys`, which a plugin reload doesn't replace: `hermes plugins install` re-imports every plugin
+# inside the running gateway, and Hermes doesn't always wire the new copy on the live adapter after.
+# On 2026-11-26 it didn't, so for 25 minutes the new copy had no relay: no guide, and its turn hooks
+# fed a list no relay reported, so autolinear reminded Hermes about turns still running (LEON-533).
+_LIVE_RELAY = "_hermes22muse_live_relay"
+
+
+def live_relay():
+    """The relay this gateway process runs, or None."""
+    relay, worker = getattr(sys, _LIVE_RELAY, None) or (None, None)
+    return relay if worker is not None and not worker.done() else None
+
+
 def register(ctx):
     owner = os.getenv("HERMES22MUSE_SLACK_USER_ID", "").strip()
     url = os.getenv("HERMES22MUSE_MCP_URL", "").strip()
@@ -247,6 +262,14 @@ def register(ctx):
     relay = None
     web = None
     turns = Turns()
+    running = live_relay()
+    if running is not None:
+        # A reload inside the running gateway: this copy's tools and hooks use the running relay, with
+        # its muse.ai login and turn list, until the next restart.
+        relay = running
+        web = running.web
+        turns = running.turns if running.turns is not None else turns
+        LOG.info("hermes22muse: reusing the running Muse handoff relay after a plugin reload")
 
     def app():
         nonlocal web
@@ -584,6 +607,7 @@ def register(ctx):
         relay = current
         adapter._hermes22muse_worker = worker
         adapter._hermes22muse_relay = current
+        setattr(sys, _LIVE_RELAY, (current, worker))
         # Older AutoLinear versions use the ownership hook to skip direct Codex dispatch.
         # The thread hook keeps replies in an existing collaboration thread, even without Muse.
         adapter._hermes22muse_owns_request = owns_slack_request
@@ -646,6 +670,8 @@ def register(ctx):
                 adapter.disconnect = disconnect
                 adapter._hermes22muse_worker = None
                 adapter._hermes22muse_relay = None
+                if (getattr(sys, _LIVE_RELAY, None) or (None,))[0] is current:
+                    delattr(sys, _LIVE_RELAY)
                 await disconnect(*args, **kwargs)
 
         adapter.disconnect = disconnect_and_stop

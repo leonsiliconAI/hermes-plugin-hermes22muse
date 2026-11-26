@@ -562,12 +562,13 @@ class Relay:
             return (await client.post(url, json=payload, headers=headers)).status_code
 
     async def report_turns(self):
-        """Tell autolinear which issue channels have a running turn, so it doesn't remind Hermes there."""
+        """Tell autolinear which issue channels have a running turn, so it doesn't remind Hermes there.
+        The report goes out with no channels too: autolinear only trusts a missing channel while
+        reports keep coming, since a gateway that has lost track of its turns sends none."""
         channels = sorted(chat for chat in self.turns.running() if chat.startswith(("C", "G")))
-        if channels:
-            status = await self.post_autolinear("/turns", {"channels": channels})
-            if status is not None and not 200 <= status < 300:
-                LOG.warning("hermes22muse: autolinear refused the running turns (%s)", status)
+        status = await self.post_autolinear("/turns", {"channels": channels})
+        if status is not None and not 200 <= status < 300:
+            LOG.warning("hermes22muse: autolinear refused the running turns (%s)", status)
 
     async def report_unread(self):
         """Ask autolinear to wake Hermes for each Muse answer that no running turn will read: Hermes

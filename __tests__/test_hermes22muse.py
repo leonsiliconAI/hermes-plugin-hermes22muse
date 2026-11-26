@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import importlib.util
 import json
 import os
@@ -527,15 +527,17 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
 
         turns = Turns()
         self.relay = Relay(self.store, self.slack, self.muse, OWNER, turns=turns, post=post)
+        url = "https://autolinear.leonsilicon.ai/turns"
         with patch.dict(os.environ, {"AUTOLINEAR_TOKEN": "token"}):
             await self.relay.report_turns()
             turns.start("a", "1", "D0DM")
             await self.relay.report_turns()
-            self.assertEqual(sent, [], "nothing to report")
+            # No turn in a channel still goes out: autolinear trusts a missing channel only while reports come.
+            self.assertEqual(sent, [(url, {"channels": []})] * 2)
             turns.start("b", "1", "C0B")
             turns.start("c", "1", "G0A")
             await self.relay.report_turns()
-        self.assertEqual(sent, [("https://autolinear.leonsilicon.ai/turns", {"channels": ["C0B", "G0A"]})])
+        self.assertEqual(sent[-1], (url, {"channels": ["C0B", "G0A"]}))
 
     def test_answers_from_before_the_upgrade_count_as_read(self):
         import sqlite3
@@ -638,9 +640,9 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
     def call(self, name, **args):
         return json.loads(self.tools[name](args))
 
-    def register_again(self):
+    def register_again(self, wire=True):
         """What `hermes plugins install` does to the running gateway: the plugin registers again and
-        Hermes wires the new copy on the live adapter."""
+        Hermes wires the new copy on the live adapter, or (as on 2026-11-26) doesn't."""
         tools, hooks = {}, {}
         ctx = SimpleNamespace(
             register_tool=lambda name, handler, **kw: tools.__setitem__(name, handler),
@@ -649,9 +651,10 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.dict(os.environ, self.env):
             plugin.register(ctx)
-        constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
-        with patch.dict(sys.modules, {"hermes_constants": constants}), patch.object(plugin, "keep_crash_log"):
-            ctx.wire(None, self.adapter)
+        if wire:
+            constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
+            with patch.dict(sys.modules, {"hermes_constants": constants}), patch.object(plugin, "keep_crash_log"):
+                ctx.wire(None, self.adapter)
         return tools, hooks
 
     async def build_turn(self, ts=REQUEST, name="leon-1-test", **raw):
@@ -726,6 +729,29 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         result = json.loads(tools["slack_task_progress"]({"quick_answer": "I'll check your calendar."}))
         self.assertEqual(result["quick_answer"], "I'll check your calendar.")
         self.assertIs(self.adapter._hermes22muse_relay, relay)
+
+    async def test_a_reload_hermes_never_wires_still_uses_the_running_relay(self):
+        # 2026-11-26: Hermes reloaded the plugin and never wired the new copy, whose hooks then fed a
+        # turn list no relay reported, so autolinear reminded Hermes about a turn still running (LEON-533).
+        root = (await self.build_turn()).source.thread_id
+        relay = self.adapter._hermes22muse_relay
+        tools, hooks = self.register_again(wire=False)
+        self.session.update(thread_id=root)
+        guide = hooks["pre_llm_call"](platform="slack", session_id="s", turn_id="t")["context"]
+        self.assertTrue(guide.startswith("[Task progress]"))
+        self.assertIn(CHANNEL, relay.turns.running())
+        self.assertEqual(hooks["pre_tool_call"](tool_name="terminal", args={})["action"], "block")
+        result = json.loads(tools["slack_task_progress"]({"quick_answer": "I'll check your calendar."}))
+        self.assertEqual(result["quick_answer"], "I'll check your calendar.")
+
+    async def test_a_stopped_relay_is_never_reused(self):
+        worker = self.adapter._hermes22muse_worker
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+        self.assertIsNone(plugin.live_relay())
+        tools, hooks = self.register_again(wire=False)
+        self.assertIsNone(hooks["pre_llm_call"](platform="slack", session_id="s", turn_id="t"))
 
     async def test_turn_hooks_never_get_in_hermess_way(self):
         self.assertIsNotNone(self.hooks["pre_llm_call"](platform="slack", session_id="s", turn_id="t"))
