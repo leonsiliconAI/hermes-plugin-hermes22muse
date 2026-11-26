@@ -174,8 +174,16 @@ function progressSection(text) {
 		}
 	};
 }
+/**
+* Hermes's notices about a message it didn't take in (gateway/session_ingress.py): one already
+* received with other content, one it refused, a full queue, a draining gateway. Each answers the
+* message that was turned away, never the task. LEON-540 (2026-11-26): an unfurl edit of Leon's
+* message became a second turn on the task's message id, Hermes refused it, and "⚠️ Hermes already
+* received a different message under this message id…" replaced the answer on Task progress.
+*/
+const ADMISSION_NOTICE = /^\s*(?::[a-z0-9_+-]+:|\p{Extended_Pictographic}\uFE0F?)\s*(?:Hermes already received a different message under this message id|Hermes refused this message|Too many messages are already waiting|Gateway is \S[^\n]* and is not accepting new work)/u;
 function publishTaskAnswer(text) {
-	return !!text.trim() && !/^\s*To (?:Muse|Codex|Grok Bot):/i.test(text);
+	return !!text.trim() && !/^\s*To (?:Muse|Codex|Grok Bot):/i.test(text) && !ADMISSION_NOTICE.test(text);
 }
 function slackChunks(text) {
 	const rest = Array.from(text);

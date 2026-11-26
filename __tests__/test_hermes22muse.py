@@ -1019,6 +1019,16 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[2][3]["thread_id"], root)
         self.assertEqual(progress.read(route)["answer"], first)
         self.assertEqual(progress.read(route)["version"], version)
+        # Hermes's notice about a message it turned away is no answer to the task (LEON-540): it goes
+        # into the thread like any reply, and the card keeps its answer.
+        notice = ("⚠️ Hermes already received a different message under this message id, so this "
+                  "version was not saved. Send it again as a new message to continue.")
+        await self.adapter.send_final_ledgered(event, "session", notice, {**thread, "notify": True},
+                                               reply_to=root)
+        self.assertEqual((sent[3][1], sent[3][3]["thread_id"]), (notice, root))
+        self.assertEqual(progress.read(route)["answer"], first)
+        self.assertEqual(progress.read(route)["version"], version)
+        del sent[3]
 
         # Leon's reply in the card's thread changes the card.
         in_thread = "1795000003.000001"
