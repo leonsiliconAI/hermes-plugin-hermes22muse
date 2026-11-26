@@ -178,7 +178,9 @@ PROGRESS_SCHEMA = {
         "Read the latest Hermes answer and the Grok Bot, Muse and Codex updates for this Slack task. "
         "With quick_answer, show Leon your short first answer at the top of Task progress before you start the work. "
         "With summary, replace the current status with checked milestones, blockers and next steps. "
-        "Give your full answer as your final response so Hermes can save it to Task progress."
+        "Give your full answer as your final response so Hermes can save it to Task progress. "
+        "Only the request that opened Task progress and messages in its thread change it: Leon's later "
+        "messages at the top of the channel are answered there."
     ),
     "parameters": {
         "type": "object",
@@ -449,6 +451,8 @@ def register(ctx):
         entry = progress.read(route)
         # Before 2.13.0 the quick answer was a plan; sessions that started then may still send `plan`.
         plan = args.get("quick_answer", args.get("plan"))
+        if (plan is not None or args.get("summary") is not None) and is_follow_up(current):
+            return json.dumps({"error": call(__file__, "followUpProgress")})
         if plan is not None:
             if not isinstance(plan, str) or not plan.strip() or len(plan) > 600:
                 return json.dumps({"error": "Use a quick answer between 1 and 600 characters."})
@@ -480,7 +484,15 @@ def register(ctx):
         if current is None:
             return None
         job = relay.store.find(current["scope_id"], current["chat_id"], thread=current["thread_id"]) if current["thread_id"] else None
-        return call(__file__, "guideForTurn", current, owner, dict(job) if job else None, needs_plan(current))
+        return call(__file__, "guideForTurn", current, owner, dict(job) if job else None, needs_plan(current),
+                    is_follow_up(current))
+
+    def is_follow_up(current):
+        """Whether Leon wrote this turn's message at the top of an issue channel after its card opened."""
+        # After a live plugin reload the running relay's Progress can predate follow-ups (2.14.0).
+        check = getattr(relay.store.progress, "is_follow_up", None)
+        return bool(check and current.get("message_id") and
+                    check(current["scope_id"], current["chat_id"], current["message_id"]))
 
     def needs_plan(current):
         thread = current.get("thread_id")

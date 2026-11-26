@@ -4,7 +4,7 @@ Hermes can hand research and complex work to Muse side chats, review Muse’s an
 
 1. Hermes works out the request from the conversation and chooses the agents it needs. When it chooses Muse, Hermes writes a self-contained brief in the user’s own voice and sends it through `muse_handoff`.
 2. The `slack22muse` app posts Muse’s replies as **Muse** in the channel thread. For a one-to-one DM with Hermes, it opens a separate thread in the **Muse** DM and links back to the original request. Hermes checks the replies, sends follow-ups with `muse_reply`, and uses `muse_wait` when Muse needs more than about five minutes.
-3. Hermes edits **Task progress** with its reviewed answer. For ordinary channel messages outside issue channels, [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts answers at the top level.
+3. Hermes edits **Task progress** with its reviewed answer. It answers Leon's later messages at the top of the issue channel with new messages in the channel. For ordinary channel messages outside issue channels, [slack-flat-replies](../hermes-plugin-slack-flat-replies/README.md) puts answers at the top level.
 
 Replies in existing handoff threads keep their Muse context. Messages typed directly in the side chat appear in Slack with a “You in Muse” label. File bytes, edits and deletions do not sync. Treat both the thread and the side chat as visible to everyone with access to the Slack conversation.
 
@@ -22,7 +22,8 @@ On Leon's first request in a new issue channel, Hermes posts **Task progress** a
 
 - Start a reply with `To Muse:` to route a Grok Bot or Codex message to the existing Muse side chat. Hermes labels it as peer input. Retries and edits update the Slack record without forwarding the same reply again.
 - Muse’s replies can start with `To Codex:` or `To Grok Bot:`. Codex reads the shared thread through Slack Puppet. Grok Bot receives peer replies through its conversation bridge. Hermes handles Leon’s follow-ups to Muse with `muse_reply`.
-- Hermes edits **Task progress** with its latest response, including the final outcome. Drafts wait for the completed response. Explicit follow-ups addressed to an agent remain thread replies. The card also links to the latest reply from each agent and survives gateway restarts along with pending updates. `slack_task_progress` can show the latest answer or replace it with a checked progress summary. Autolinear reads Hermes’s status commands from the edited card.
+- Hermes edits **Task progress** with its latest response to the request that opened it or to a message in its thread, including the final outcome. Drafts wait for the completed response.
+- Only that thread changes **Task progress** (Leon's rule, 2026-11-26). When Leon writes again at the top of the issue channel, Hermes answers with a new message in the channel and leaves the card as it was. The turn still runs in the thread's conversation, so Hermes keeps the task's context, and `slack_task_progress` refuses to change the card during it. Explicit follow-ups addressed to an agent remain thread replies. The card also links to the latest reply from each agent and survives gateway restarts along with pending updates. `slack_task_progress` can show the latest answer or replace it with a checked progress summary. Autolinear reads Hermes’s status commands from the edited card.
 - Existing collaborations keep the thread their agents joined. Their progress message links to that thread.
 
 Update [slack-as-leon-guard](../hermes-plugin-slack-as-leon-guard/README.md) to 1.3.0 or later so reports and Hermes’s replies stay in the collaboration thread. Install the current Beeper inbox release and configure Slack Puppet for the Codex environments that will join.

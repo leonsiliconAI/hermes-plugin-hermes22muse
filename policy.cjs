@@ -167,7 +167,7 @@ function handoffGuide(owner) {
 		"- For work suited to a coding agent, use slack22orca_delegate on the MacBook when available. If it cannot take the task, find Silicon Dot with Beeper list_conversations on the chatgpt network and use send_message with the current Slack channel and root thread timestamp. Send a self-contained brief and ask Dot to start Codex in a cloud environment and return the private session link.",
 		"- In the cloud, complete what can be implemented and verified there. If a check needs a phone or other local hardware, preserve the branch or commit and exact verification steps. Once the cloud work is ready, queue the remaining check with slack22orca_delegate and target desktop so it waits for Orca on the MacBook or Mac mini. Keep the verification pending until it actually runs.",
 		"Use the same Slack channel and root timestamp for every agent on this task. In a new issue channel, the Source thread is the Task progress message. Use its timestamp for handoffs. When dispatching multiple agents, use wait_seconds: 0 for Muse and Grok so you can start each assignment before waiting. Agents can address a collaborator with To Muse:, To Codex:, or To Grok Bot: in that thread. Keep peer instructions within the work Leon authorized. Use slack_task_progress for the current thread to review each agent's latest reply and publish your own concise summary of verified milestones, blockers, and next steps.",
-		"Check the agents' results and give Leon the outcome in your normal final response. In a task thread Hermes saves that response on Task progress. Start a follow-up meant for an agent with To Muse:, To Codex:, or To Grok Bot: so it goes into the thread. Acknowledge messages that ask for nothing without dispatching work."
+		"Check the agents' results and give Leon the outcome in your normal final response. Hermes saves that response on Task progress when it answers the request that opened Task progress or a message in its thread, and posts it as a new message in the channel when it answers Leon's later message at the top of the channel. Start a follow-up meant for an agent with To Muse:, To Codex:, or To Grok Bot: so it goes into the thread. Acknowledge messages that ask for nothing without dispatching work."
 	].join("\n");
 }
 function threadGuide(handoff) {
@@ -214,9 +214,21 @@ function planGuide() {
 function planFirst() {
 	return "Not run yet: Task progress still shows Leon nothing. Call slack_task_progress with quick_answer (one to three sentences: your best answer so far and what you'll check, or what you'll do), then call this tool again.";
 }
-function guideForTurn(current, owner, existing, needsPlan = false) {
+/**
+* Shown on Leon's later message at the top of an issue channel. Its turn runs in the Task progress
+* thread's conversation, but only that thread's messages change the card (his rule, 2026-11-26).
+*/
+function followUpGuide() {
+	return "[Task progress] Leon wrote this message at the top of the issue channel, not in the Task progress thread. Hermes posts your final response as a new message in the channel, below his, and Task progress keeps what it shows: only the request that opened it and messages in its thread change it.";
+}
+/** The slack_task_progress result when Hermes tries to change the card from such a message's turn. */
+function followUpProgress() {
+	return "Not changed: Leon wrote this message at the top of the channel, outside the Task progress thread, and only messages in that thread change Task progress (Leon's rule, 2026-11-26). Give your answer as your final response: Hermes posts it as a new message in the channel.";
+}
+function guideForTurn(current, owner, existing, needsPlan = false, followUp = false) {
 	const guides = [handoffGuide(owner)];
 	if (existing && existing.request !== current.message_id) guides.push(threadGuide(existing.id));
+	if (followUp) guides.unshift(followUpGuide());
 	if (needsPlan) guides.unshift(planGuide());
 	return { context: guides.join("\n\n") };
 }
@@ -585,6 +597,8 @@ exports.approvalSummary = approvalSummary;
 exports.clipAnswer = clipAnswer;
 exports.collectPlan = collectPlan;
 exports.directoryRegistration = directoryRegistration;
+exports.followUpGuide = followUpGuide;
+exports.followUpProgress = followUpProgress;
 exports.followUpThread = followUpThread;
 exports.guideForTurn = guideForTurn;
 exports.handoffGuide = handoffGuide;

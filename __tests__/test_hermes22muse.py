@@ -74,14 +74,39 @@ def fake_adapter():
     ), chat_update=AsyncMock(side_effect=lambda **kw: {
         "ok": True, "ts": kw["ts"], "channel": kw["channel"],
     }))
+    sent = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        """What reaches Hermes's own Slack send, past the plugin."""
+        sent.append((chat_id, content, reply_to, metadata))
+        return SendResult(success=True, message_id=f"1795000300.{len(sent):06d}")
+
+    async def send_final_ledgered(event, session_key, text, metadata, *, reply_to, is_ephemeral_response=False):
+        # The gateway's ledger sends through whatever adapter.send is now, the plugin's wrapper included.
+        return await adapter.send(CHANNEL, text, reply_to=reply_to, metadata=metadata), adapter
+
     adapter = SimpleNamespace(
         _outbound_blocked=lambda channel, action: False,
         _get_client=lambda channel, team_id: client,
         _team_clients={TEAM: client},
         _running=False,
         disconnect=AsyncMock(),
+        send=send,
+        send_final_ledgered=send_final_ledgered,
+        format_message=lambda text: text,
+        sent=sent,
     )
     return adapter, client
+
+
+class SendResult(SimpleNamespace):
+    def __init__(self, success, message_id=None, error=None):
+        super().__init__(success=success, message_id=message_id, error=error)
+
+
+# The one gateway import the plugin makes when it wires delivery.
+GATEWAY = {"gateway": SimpleNamespace(), "gateway.platforms": SimpleNamespace(),
+           "gateway.platforms.base": SimpleNamespace(SendResult=SendResult)}
 
 
 def posts(client):
@@ -594,7 +619,8 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.adapter._register_mentioned_thread = Mock()
         constants = SimpleNamespace(get_hermes_home=lambda: self.directory)
-        with patch.dict(sys.modules, {"hermes_constants": constants}), patch.object(plugin, "keep_crash_log"):
+        with patch.dict(sys.modules, {"hermes_constants": constants, **GATEWAY}), \
+                patch.object(plugin, "keep_crash_log"):
             ctx.wire(None, self.adapter)
         self.addAsyncCleanup(self.adapter.disconnect)
         self.session = {"platform": "slack", "scope_id": TEAM, "chat_id": CHANNEL, "thread_id": "",
@@ -864,6 +890,69 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         # A session that started before 2.13.0 still has the plan wording.
         result = self.call("slack_task_progress", plan="I'll check the calendar again.")
         self.assertEqual(result["quick_answer"], "I'll check the calendar again.")
+
+    async def test_only_the_task_progress_thread_changes_the_card(self):
+        """Leon, 2026-11-26: "after i ask a follow up, hermes should NOT edit the original message. the original
+        message should only be edited based on new inputs in that message thread"."""
+        opening, follow_up = await asyncio.gather(self.build_turn(), self.build_turn(LATER))
+        root = opening.source.thread_id
+        route, progress = (TEAM, CHANNEL, root), self.store.progress
+        # The follow-up still runs in the card thread's conversation, so Hermes keeps its context.
+        self.assertEqual(follow_up.source.thread_id, root)
+        self.assertTrue(progress.is_follow_up(TEAM, CHANNEL, LATER))
+        await self.build_turn()  # Slack delivering the opening request twice doesn't make it a follow-up.
+        self.assertFalse(progress.is_follow_up(TEAM, CHANNEL, REQUEST))
+        thread = {"thread_id": root, "slack_team_id": TEAM}
+        event = SimpleNamespace(is_command=lambda: False)
+        sent = self.adapter.sent
+
+        first = "Probably the agent that runs your browser work. I'll check.\n\n@Autolinear stay"
+        await self.adapter.send_final_ledgered(event, "session", first, {**thread, "notify": True}, reply_to=REQUEST)
+        self.assertEqual(sent, [])
+        self.assertEqual(progress.read(route)["answer"], first)
+        version = progress.read(route)["version"]
+
+        # Leon's follow-up at the top of the channel: answered there, the card keeps its answer.
+        self.session.update(thread_id=root, message_id=LATER)
+        guide = self.hooks["pre_llm_call"](platform="slack")["context"]
+        self.assertTrue(guide.startswith("[Task progress] Leon wrote this message at the top of the issue channel"))
+        for change in ({"summary": "Grok Bot is the browser agent."}, {"quick_answer": "It's Grok Bot."}):
+            self.assertIn("only messages in that thread change Task progress",
+                          self.call("slack_task_progress", **change)["error"])
+        self.assertEqual(self.call("slack_task_progress")["latest_answer"], first)
+        draft = await self.adapter.send(CHANNEL, "The browser", metadata={
+            **thread, "expect_edits": True, "reply_to_message_id": LATER})
+        self.assertFalse(draft.success)  # Drafts still wait for the completed answer.
+        answer = "The browser agent is Grok Bot.\n\n@Autolinear stay"
+        result, _ = await self.adapter.send_final_ledgered(event, "session", answer, {**thread, "notify": True},
+                                                           reply_to=LATER)
+        self.assertEqual(result.message_id, "1795000300.000001")
+        self.assertEqual(sent, [(CHANNEL, answer, None, {"slack_team_id": TEAM, "notify": True})])
+        # The streaming consumer's final names the message it answers in its metadata (also after a redirect).
+        await self.adapter.send(CHANNEL, "Streamed answer.", metadata={
+            **thread, "notify": True, "reply_to_message_id": LATER})
+        self.assertEqual(sent[1], (CHANNEL, "Streamed answer.", None,
+                                   {"slack_team_id": TEAM, "notify": True, "reply_to_message_id": LATER}))
+        # A message for an agent still goes into the thread.
+        await self.adapter.send(CHANNEL, "To Muse: which agent did you use?", reply_to=LATER,
+                                metadata={**thread, "notify": True, "_hermes_task_answer": True})
+        self.assertEqual(sent[2][3]["thread_id"], root)
+        self.assertEqual(progress.read(route)["answer"], first)
+        self.assertEqual(progress.read(route)["version"], version)
+
+        # Leon's reply in the card's thread changes the card.
+        in_thread = "1795000003.000001"
+        self.session.update(message_id=in_thread)
+        self.assertNotIn("[Task progress]", self.hooks["pre_llm_call"](platform="slack")["context"])
+        self.assertNotIn("error", self.call("slack_task_progress", summary="Checking with Grok Bot."))
+        await self.adapter.send_final_ledgered(event, "session", "It's Grok Bot.\n\n@Autolinear move done",
+                                               {**thread, "notify": True}, reply_to=in_thread)
+        self.assertEqual(len(sent), 3)
+        await progress.flush(Slack(self.adapter, BOT_TOKEN))
+        update = self.client.chat_update.await_args.kwargs
+        self.assertEqual(update["ts"], root)
+        self.assertTrue(update["text"].endswith("*Update from Hermes*\nIt's Grok Bot.\n\n@Autolinear move done"))
+        self.assertNotIn("The browser agent is Grok Bot.", update["text"])
 
     async def test_cards_from_before_plans_keep_working(self):
         with self.store.connection() as db:

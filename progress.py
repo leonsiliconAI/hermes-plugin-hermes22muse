@@ -29,6 +29,12 @@ class Progress:
                     revision TEXT NOT NULL, text TEXT NOT NULL,
                     PRIMARY KEY(team, channel, root, agent)
                 );
+                -- Leon's later top-level messages in an issue channel. Their turns run in the card's
+                -- thread, for its context, but their answers never change the card.
+                CREATE TABLE IF NOT EXISTS progress_follow_ups (
+                    team TEXT, channel TEXT, ts TEXT, root TEXT NOT NULL,
+                    PRIMARY KEY(team, channel, ts)
+                );
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(progress)")}
             if "answer" not in columns:
@@ -40,13 +46,19 @@ class Progress:
                 db.execute("ALTER TABLE progress ADD COLUMN request TEXT")
 
     async def open_thread(self, slack, team, channel, request=None):
-        """Return the issue's thread, posting the top-level progress message on first use."""
+        """Return the issue's thread, posting the top-level progress message on first use.
+
+        Any other top-level ``request`` is a follow-up: it joins the thread's conversation, but its
+        answer goes to the channel and leaves the card alone (Leon's rule, 2026-11-26)."""
         async with self._opening.setdefault((team, channel), asyncio.Lock()):
             with self.connection() as db:
                 existing = db.execute(
-                    "SELECT root FROM progress WHERE team=? AND channel=? "
+                    "SELECT root, request FROM progress WHERE team=? AND channel=? "
                     "ORDER BY COALESCE(root=card, 0) DESC, root DESC LIMIT 1", (team, channel),
                 ).fetchone()
+                if existing is not None and request and request != existing["request"]:
+                    db.execute("INSERT OR IGNORE INTO progress_follow_ups(team, channel, ts, root) "
+                               "VALUES (?, ?, ?, ?)", (team, channel, request, existing["root"]))
             # Existing issues may have agents already committed to the original request's thread.
             if existing is not None:
                 return existing["root"]
@@ -67,6 +79,12 @@ class Progress:
         with self.connection() as db:
             self._changed(db, route)
             db.execute("UPDATE progress SET plan=? WHERE team=? AND channel=? AND root=?", (plan, *route))
+
+    def is_follow_up(self, team, channel, ts):
+        """Whether Leon wrote ``ts`` at the top of the channel after the card opened."""
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM progress_follow_ups WHERE team=? AND channel=? AND ts=?",
+                              (team, channel, ts)).fetchone() is not None
 
     def is_thread(self, team, channel, root):
         with self.connection() as db:
@@ -205,6 +223,14 @@ def wire_progress_delivery(adapter, progress):
                     # The edit-stream consumer will deliver the completed text at the end of the turn.
                     return SendResult(success=False, error="Task progress uses completed replies")
                 if call(__file__, "publishTaskAnswer", content):
+                    # The reply anchor is the message being answered, also after a redirected turn.
+                    anchor = metadata.get("reply_to_message_id") or reply_to
+                    if anchor and progress.is_follow_up(route[0], chat_id, anchor):
+                        # Only messages in the card's thread change the card (Leon's rule, 2026-11-26). A
+                        # later top-level message is answered at the top of the channel, like any other.
+                        flat = {key: value for key, value in metadata.items()
+                                if key not in ("thread_id", "thread_ts", "_hermes_task_answer")}
+                        return await send(chat_id, content, reply_to=None, metadata=flat)
                     progress.finish(route, adapter.format_message(content).strip())
                     # The durable queue owns delivery. The consumer must never treat the parent as a draft ID.
                     return SendResult(success=True)
